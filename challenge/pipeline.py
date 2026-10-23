@@ -36,29 +36,142 @@ SYSTEM_PROMPT = ("You are a recruiting assistant. Answer ONLY from the numbered 
 CV_TYPES = {".pdf", ".docx", ".txt", ".md"}
 CHUNK_SIZE = 800          # characters per chunk
 CHUNK_OVERLAP = 100       # characters shared by two neighbouring chunks
+MIN_CHARS = 200           # less text than this: the reader probably missed the CV
+INGEST_REPORT = []        # one row per file from the last load_cvs: source, status, chars, detail
+
+
+def read_pdf(path):
+    import logging
+    from pypdf import PdfReader
+    logging.getLogger("pypdf").setLevel(logging.ERROR)    # hide "wrong pointing object" noise
+    return "\n".join(page.extract_text() or "" for page in PdfReader(path).pages)
+
+
+def docx_paragraph(element):
+    """The text of one Word paragraph, text boxes inside it included. A text box is stored twice
+    (a modern copy and an mc:Fallback copy for old Word): read only the first."""
+    from docx.oxml.ns import qn
+    parts = []
+    for n in element.iterchildren():
+        if not isinstance(n.tag, str) or n.tag.endswith("}Fallback"):
+            continue
+        if n.tag == qn("w:t"):
+            parts.append(n.text or "")
+        elif n.tag == qn("w:tab"):
+            parts.append("\t")
+        elif n.tag in (qn("w:br"), qn("w:cr")) or (n.tag == qn("w:p") and parts):
+            parts.append("\n")
+        if n.tag != qn("w:t"):
+            parts.append(docx_paragraph(n))
+    return "".join(parts)
+
+
+def docx_blocks(element):
+    """The text of a Word body, cell, header or footer, top to bottom: paragraphs and tables
+    in the order they appear, nested tables included, each cell read once."""
+    from docx.oxml.ns import qn
+    lines = []
+    for child in element.iterchildren():
+        if child.tag == qn("w:p"):
+            lines.append(docx_paragraph(child))
+        elif child.tag == qn("w:tbl"):
+            for row in child.iterchildren(qn("w:tr")):
+                cells = ["\n".join(docx_blocks(cell)).strip() for cell in row.iterchildren(qn("w:tc"))]
+                cells = [c for c in cells if c]
+                if all("\n" not in c for c in cells):
+                    lines.append(" | ".join(cells))    # a data row: keep its cells on one line
+                else:
+                    lines.extend(cells)                # a layout row (columns): one cell after the other
+        elif child.tag == qn("w:sdt"):                 # content control: read what is inside
+            for content in child.iterchildren(qn("w:sdtContent")):
+                lines.extend(docx_blocks(content))
+    return lines
+
+
+def read_docx(path):
+    import docx
+    d = docx.Document(path)
+    lines, seen = [], set()
+    for section in d.sections:                         # headers often hold the name: read each one once
+        for part in (section.header, section.footer):
+            if not part.is_linked_to_previous:
+                for line in docx_blocks(part._element):
+                    if line.strip() and line not in seen:
+                        seen.add(line)
+                        lines.append(line)
+    return "\n".join(lines + docx_blocks(d.element.body))
 
 
 def read_file(path):
     """The plain text of one CV file."""
     suffix = path.suffix.lower()
     if suffix == ".pdf":
-        from pypdf import PdfReader
-        return "\n".join(page.extract_text() or "" for page in PdfReader(path).pages)
+        return read_pdf(path)
     if suffix == ".docx":
-        import docx
-        return "\n".join(p.text for p in docx.Document(path).paragraphs)
+        return read_docx(path)
     return path.read_text(encoding="utf-8", errors="ignore")
+
+
+SPACED = re.compile(r"(?<![^\W\d_])(?:[^\W\d_] ){2,}[^\W\d_](?![^\W\d_])")   # "P R O F I L E"
+SEPARATOR = re.compile(r"[-–—_=*~•·.─━═▪■□●○◆◇|]{4,}")                      # "————", "=====", "....."
+
+
+def normalize(text):
+    """Clean extracted text without changing its words: join letter-spaced headings, drop
+    decorative separator runs, tidy spaces and blank lines."""
+    text = text.replace(" ", " ").replace("​", "").replace("\r", "\n")
+    text = SPACED.sub(lambda m: m.group().replace(" ", ""), text)
+    text = SEPARATOR.sub(" ", text)
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.split("\n")]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
 
 
 def load_cvs(folder):
     """Read every CV in `folder` (PDF, DOCX, TXT, MD).
     Return a list of documents: [{"source": "<file name>", "text": "<all the text>"}, ...]
-    `source` must be the FILE NAME: Verify checks retrieval against it."""
+    `source` must be the FILE NAME: Verify checks retrieval against it.
+    Exact duplicate files and files without text are left out, and every file gets a row in
+    INGEST_REPORT (printed to the console), so nothing is skipped silently."""
+    import hashlib
+    INGEST_REPORT.clear()
+    paths = [p for p in sorted(pathlib.Path(folder).iterdir()) if p.is_file() and p.suffix.lower() in CV_TYPES]
+    digest = {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
+    keep = {}                                          # one file per content: the shortest name ("CV.pdf", not "CV 2.pdf")
+    for path in sorted(paths, key=lambda p: (len(p.name), p.name)):
+        keep.setdefault(digest[path], path.name)
     docs = []
-    for path in sorted(pathlib.Path(folder).iterdir()):
-        if path.is_file() and path.suffix.lower() in CV_TYPES:
-            docs.append({"source": path.name, "text": read_file(path).strip()})
+    for path in paths:
+        row = {"source": path.name, "status": "ok", "chars": 0, "detail": ""}
+        INGEST_REPORT.append(row)
+        if keep[digest[path]] != path.name:
+            row.update(status="duplicate", detail=f"same bytes as {keep[digest[path]]}: not indexed twice")
+            continue
+        try:
+            text = normalize(read_file(path))
+        except Exception as e:
+            row.update(status="failed", detail=f"{type(e).__name__}: {e}")
+            continue
+        row["chars"] = len(text)
+        if not text:
+            row.update(status="empty", detail="no text extracted (scanned image? unsupported layout?)")
+            continue
+        if len(text) < MIN_CHARS:
+            row.update(status="short", detail=f"only {len(text)} characters: check this CV")
+        docs.append({"source": path.name, "text": text})
+    print_ingest_report()
+    if INGEST_REPORT and not docs:
+        raise ValueError(f"none of the {len(INGEST_REPORT)} CV files gave text: see the console")
     return docs
+
+
+def print_ingest_report():
+    counts = {}
+    for row in INGEST_REPORT:
+        counts[row["status"]] = counts.get(row["status"], 0) + 1
+    print("Ingestion: " + ", ".join(f"{n} {status}" for status, n in counts.items()))
+    for row in INGEST_REPORT:
+        if row["status"] != "ok":
+            print(f"  {row['status'].upper():9} {row['source']}: {row['detail']}")
 
 
 def chunk(doc):
