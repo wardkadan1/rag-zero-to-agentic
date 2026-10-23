@@ -33,18 +33,45 @@ SYSTEM_PROMPT = ("You are a recruiting assistant. Answer ONLY from the numbered 
 # Prompt idea: "In challenge/pipeline.py implement load_cvs and chunk as their docstrings say.
 #  Use pypdf for PDF and python-docx for DOCX. Start with fixed-size chunks of 800 characters
 #  with 100 overlap. Don't change other files."
+CV_TYPES = {".pdf", ".docx", ".txt", ".md"}
+CHUNK_SIZE = 800          # characters per chunk
+CHUNK_OVERLAP = 100       # characters shared by two neighbouring chunks
+
+
+def read_file(path):
+    """The plain text of one CV file."""
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        from pypdf import PdfReader
+        return "\n".join(page.extract_text() or "" for page in PdfReader(path).pages)
+    if suffix == ".docx":
+        import docx
+        return "\n".join(p.text for p in docx.Document(path).paragraphs)
+    return path.read_text(encoding="utf-8", errors="ignore")
+
+
 def load_cvs(folder):
     """Read every CV in `folder` (PDF, DOCX, TXT, MD).
     Return a list of documents: [{"source": "<file name>", "text": "<all the text>"}, ...]
     `source` must be the FILE NAME: Verify checks retrieval against it."""
-    raise NotImplementedError("LEVEL 1: implement load_cvs() in challenge/pipeline.py")
+    docs = []
+    for path in sorted(pathlib.Path(folder).iterdir()):
+        if path.is_file() and path.suffix.lower() in CV_TYPES:
+            docs.append({"source": path.name, "text": read_file(path).strip()})
+    return docs
 
 
 def chunk(doc):
     """Split ONE document into chunks.
     Return [{"id": "<unique id>", "source": doc["source"], "text": "<chunk text>"}, ...]
     You may add more keys (they become metadata), e.g. "name", "section", "city"."""
-    raise NotImplementedError("LEVEL 1: implement chunk() in challenge/pipeline.py")
+    text, step = doc["text"], CHUNK_SIZE - CHUNK_OVERLAP
+    chunks = []
+    for start in range(0, max(len(text) - CHUNK_OVERLAP, 1), step):
+        piece = text[start:start + CHUNK_SIZE]
+        if piece.strip():
+            chunks.append({"id": f"{doc['source']}#{len(chunks)}", "source": doc["source"], "text": piece})
+    return chunks
 
 
 # ================================================================= LEVEL 2 · INDEX (the vector DB)
