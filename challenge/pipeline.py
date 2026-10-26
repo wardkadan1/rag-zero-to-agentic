@@ -196,7 +196,19 @@ COLLECTION = None
 
 def build_index(chunks):
     """Store every chunk with its vector in a Chroma collection. Return how many are stored."""
-    raise NotImplementedError("LEVEL 2: implement build_index() in challenge/pipeline.py")
+    import chromadb
+    global COLLECTION
+    client = chromadb.PersistentClient(path=str(HERE / "chroma_db"))
+    if "cvs" in [c.name for c in client.list_collections()]:
+        client.delete_collection("cvs")               # rebuild from scratch: no stale CVs left behind
+    COLLECTION = client.create_collection("cvs", metadata={"hnsw:space": "cosine"})
+    for start in range(0, len(chunks), 256):          # Chroma limits how much one add() takes
+        batch = chunks[start:start + 256]
+        COLLECTION.add(ids=[c["id"] for c in batch],
+                       documents=[c["text"] for c in batch],
+                       metadatas=[{k: v for k, v in c.items() if k not in ("id", "text")} for c in batch],
+                       embeddings=embed([c["text"] for c in batch]).tolist())
+    return COLLECTION.count()
 
 
 # ================================================================= LEVEL 3 · RETRIEVE AND PROMPT
@@ -205,12 +217,15 @@ def build_index(chunks):
 #  Implement build_prompt: number the passages [1], [2]… with their source, then the question."
 def retrieve(query, k=K):
     """Return the k best chunks: [{"rank": 1, "source": ..., "text": ..., "score": ..., "via": "vector"}, ...]"""
-    raise NotImplementedError("LEVEL 3: implement retrieve() in challenge/pipeline.py")
+    res = COLLECTION.query(query_embeddings=embed([query]).tolist(), n_results=min(k, COLLECTION.count()))
+    return [{"rank": i + 1, "source": meta["source"], "text": text, "score": 1 - dist, "via": "vector"}
+            for i, (text, meta, dist) in enumerate(zip(res["documents"][0], res["metadatas"][0], res["distances"][0]))]
 
 
 def build_prompt(question, hits):
     """The text the LLM receives: the numbered passages, then the question."""
-    raise NotImplementedError("LEVEL 3: implement build_prompt() in challenge/pipeline.py")
+    passages = "\n\n".join(f"[{i}] (from {h['source']})\n{h['text']}" for i, h in enumerate(hits, 1))
+    return f"CV passages:\n\n{passages}\n\nQuestion: {question}"
 
 
 # ================================================================= LEVEL 4 · FEATURES
