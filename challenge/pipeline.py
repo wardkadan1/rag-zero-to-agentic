@@ -407,6 +407,8 @@ def vector_search(query, n, where=None):
 
 RERANK = True             # STEP 4: False = keep the fusion order (to compare in Verify)
 FILTERS = True            # STEP 5: False = no city / years filters
+GRAPH_ON = True           # STEP 7: False = list questions use the normal search
+GRAPH_MAX = 10            # at most this many candidates from the graph (the prompt has to fit)
 RERANKER = None
 
 
@@ -430,6 +432,19 @@ def rerank(query, pool, k):
 
 def retrieve(query, k=K):
     """Return the k best chunks: [{"rank": 1, "source": ..., "text": ..., "score": ..., "via": "vector"}, ...]"""
+    route = graph_route(query)
+    if route is not None:                              # STEP 7: the graph answers list questions
+        want = question_filters(query) if FILTERS else {}
+        pool = []
+        for source, name, entity in route[:GRAPH_MAX]:
+            where = {"source": source}
+            if "years" in want:                        # a minimum of years still applies
+                where = {"$and": [where, {"years": {"$gte": want["years"]}}]}
+            best = vector_search(query, 1, where)
+            if best:
+                pool.append(dict(best[0], via=f"graph: {entity} → {name}"))
+        best = rerank(query, pool, len(pool)) if RERANK else pool
+        return [dict(h, rank=i + 1) for i, h in enumerate(best)]
     pool_size = CANDIDATES if (HYBRID or RERANK) else k
     want = question_filters(query) if FILTERS else {}
     if want:
@@ -504,8 +519,61 @@ def should_refuse(query, hits):
     return top is not None and top < REFUSE_BELOW
 
 
+# STEP 7a · a general list of tech skills (not taken from any question), matched as whole words
+SKILLS = ["python", "java", "javascript", "typescript", "c++", "c#", "kotlin", "scala", "swift", "php", "ruby", "matlab",
+          "sql", "nosql", "html", "css", "bash", "assembly", "vhdl", "verilog", "systemverilog", "flutter", "dart",
+          "react", "react native", "angular", "vue", "next.js", "node.js", "express", "django", "flask", "fastapi",
+          "spring", "spring boot", "hibernate", "laravel", ".net", "graphql", "rest api", "microservices", "websockets",
+          "mysql", "postgresql", "mongodb", "redis", "dynamodb", "firebase", "elasticsearch", "pinecone", "chroma",
+          "aws", "azure", "google cloud", "gcp", "docker", "kubernetes", "helm", "terraform", "jenkins", "github actions",
+          "ci/cd", "linux", "git", "kafka", "rabbitmq", "spark", "hadoop", "hive", "airflow", "kestra", "etl", "dbt",
+          "power bi", "tableau", "looker", "excel", "dax", "pandas", "numpy", "scikit-learn", "pytorch", "tensorflow",
+          "keras", "hugging face", "opencv", "computer vision", "nlp", "machine learning", "deep learning", "llm",
+          "rag", "langchain", "openai", "prompt engineering", "mcp", "n8n", "selenium", "playwright", "junit", "jira",
+          "figma", "arduino", "raspberry pi", "embedded", "iot", "android", "ios", "unity", "autocad", "solidworks"]
+SKILL_RE = {sk: re.compile(rf"(?<![\w+#.]){re.escape(sk)}(?![\w+#])", re.I) for sk in SKILLS}
+GRAPH = nx.Graph()
+
+
+def extract(text):
+    """STEP 7a · The skills and the city one CV mentions."""
+    return {"skills": sorted(sk for sk, rx in SKILL_RE.items() if rx.search(text)), "city": find_city(text)}
+
+
 def build_graph(chunks):
     """STEP 7 · Graph RAG: return a networkx graph with (type, name) nodes, e.g.
     ("candidate", "Lina Haddad") —has_skill— ("skill", "kubernetes"). Give candidate nodes
     source=<file name>. The 🕸 Graph tab draws it; use it in retrieve for "which candidates…" questions."""
-    return nx.Graph()
+    global GRAPH
+    g, cvs = nx.Graph(), {}
+    for c in chunks:                                   # 7b · one CV = all its chunks
+        cvs.setdefault(c["source"], {"name": c.get("name") or c["source"], "text": []})["text"].append(c["text"])
+    for source, cv in cvs.items():
+        person = ("candidate", cv["name"])
+        g.add_node(person, source=source)
+        facts = extract("\n".join(cv["text"]))
+        for sk in facts["skills"]:
+            g.add_edge(person, ("skill", sk), relation="has_skill")
+        if facts["city"]:
+            g.add_edge(person, ("city", facts["city"]), relation="lives_in")
+    GRAPH = g
+    return g
+
+
+LIST_QUESTION = re.compile(r"\b(which|who|list|all|any)\b[^?]*\bcandidates\b|\bcandidates\b[^?]*\b(who|with|that)\b", re.I)
+
+
+def graph_route(query):
+    """STEP 7c · For a "which candidates …" question that names skills or a city of the graph:
+    every candidate connected to ALL of them (no top-K limit). None when it does not apply."""
+    if not GRAPH_ON or GRAPH.number_of_nodes() == 0 or not LIST_QUESTION.search(query):
+        return None
+    named = [("skill", sk) for sk, rx in SKILL_RE.items() if rx.search(query) and GRAPH.has_node(("skill", sk))]
+    named = [n for n in named if not any(n != m and n[1] in m[1] for m in named)]   # "spring" inside "spring boot"
+    want = question_filters(query)
+    if "city" in want and GRAPH.has_node(("city", want["city"])):
+        named.append(("city", want["city"]))
+    if not named:
+        return None
+    people = set.intersection(*(set(GRAPH.neighbors(n)) for n in named))
+    return [(GRAPH.nodes[p]["source"], p[1], " + ".join(n[1] for n in named)) for p in sorted(people)]
