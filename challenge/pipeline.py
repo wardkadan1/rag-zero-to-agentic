@@ -490,9 +490,18 @@ def make_query(question, history):
     return f"{previous} {question}"
 
 
+REFUSE_BELOW = -9.5       # STEP 6: cross-encoder score of the best chunk under which we refuse
+
+
 def should_refuse(query, hits):
-    """STEP 6 · Return True when nothing relevant came back: the app answers REFUSAL without the LLM."""
-    return False
+    """STEP 6 · Return True when nothing relevant came back: the app answers REFUSAL without the LLM.
+    The reranker's score of the best chunk measures "does this passage answer this question".
+    On our questions every unanswerable one scored -10.1 to -11.3 except two near misses (-7.7, -7.0),
+    and the lowest answerable one -8.8: -9.5 refuses no valid question and accepts those two misses."""
+    if not hits:
+        return True                                    # e.g. a filter that no CV meets
+    top = hits[0].get("rerank")
+    return top is not None and top < REFUSE_BELOW
 
 
 def build_graph(chunks):
