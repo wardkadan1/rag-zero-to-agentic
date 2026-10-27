@@ -14,6 +14,7 @@ the app shows which levels work.
 Given to you (helpers.py):  embed(texts) -> normalized vectors · llm(system, user) -> answer text
 Stuck or behind?  cp challenge/checkpoints/level3.py challenge/pipeline.py   (naive RAG, done)
 """
+import collections
 import pathlib
 import re
 
@@ -391,12 +392,14 @@ def question_filters(question):
 
 
 def chroma_where(want):
-    parts = ([{"city": want["city"]}] if "city" in want else []) + ([{"years": {"$gte": want["years"]}}] if "years" in want else [])
+    parts = ([{"city": want["city"]}] if "city" in want else []) + ([{"years": {"$gte": want["years"]}}] if "years" in want else []) \
+        + ([{"source": want["source"]}] if "source" in want else [])
     return None if not parts else parts[0] if len(parts) == 1 else {"$and": parts}
 
 
 def meets(chunk, want):
-    return chunk.get("city") == want.get("city", chunk.get("city")) and chunk.get("years", 0) >= want.get("years", 0)
+    return (chunk.get("city") == want.get("city", chunk.get("city")) and chunk.get("years", 0) >= want.get("years", 0)
+            and chunk.get("source") == want.get("source", chunk.get("source")))
 
 
 def vector_search(query, n, where=None):
@@ -430,34 +433,36 @@ def rerank(query, pool, k):
     return sorted(pool, key=lambda h: -h["rerank"])[:k]
 
 
-def retrieve(query, k=K):
-    """Return the k best chunks: [{"rank": 1, "source": ..., "text": ..., "score": ..., "via": "vector"}, ...]"""
-    route = graph_route(query)
-    if route is not None:                              # STEP 7: the graph answers list questions
-        want = question_filters(query) if FILTERS else {}
-        pool = []
-        for source, name, entity in route[:GRAPH_MAX]:
-            where = {"source": source}
-            if "years" in want:                        # a minimum of years still applies
-                where = {"$and": [where, {"years": {"$gte": want["years"]}}]}
-            best = vector_search(query, 1, where)
-            if best:
-                pool.append(dict(best[0], via=f"graph: {entity} → {name}"))
-        best = rerank(query, pool, len(pool)) if RERANK else pool
-        return [dict(h, rank=i + 1) for i, h in enumerate(best)]
-    pool_size = CANDIDATES if (HYBRID or RERANK) else k
+def graph_hits(query, route):
+    """STEP 7 · Every candidate the graph connects to the question, each with its best chunk."""
     want = question_filters(query) if FILTERS else {}
-    if want:
-        print("filters:", want)
-    vec = vector_search(query, pool_size, chroma_where(want))
-    if not HYBRID:
+    pool = []
+    for source, name, entity in route[:GRAPH_MAX]:
+        where = {"source": source}
+        if "years" in want:                            # a minimum of years still applies
+            where = {"$and": [where, {"years": {"$gte": want["years"]}}]}
+        best = vector_search(query, 1, where)
+        if best:
+            pool.append(dict(best[0], via=f"graph: {entity} → {name}"))
+    best = rerank(query, pool, len(pool)) if RERANK else pool
+    return [dict(h, rank=i + 1) for i, h in enumerate(best)]
+
+
+def search(query, k=K, want=None, judge=None, hybrid=None, pool_size=CANDIDATES):
+    """One search: Chroma (+ BM25 fused with RRF), filtered by `want`, reranked against
+    `judge` (the user's question; defaults to `query`)."""
+    want = want or {}
+    hybrid = HYBRID if hybrid is None else hybrid
+    judge = judge or query
+    vec = vector_search(query, pool_size if (hybrid or RERANK) else k, chroma_where(want))
+    if not hybrid:
         pool = [dict(h, via=f"vector #{i}") for i, h in enumerate(vec, 1)]
-        best = rerank(query, pool, k) if RERANK else pool[:k]
+        best = rerank(judge, pool, k) if RERANK else pool[:k]
         return [dict(h, rank=i + 1) for i, h in enumerate(best)]
     # Reciprocal Rank Fusion: score = sum of 1/(60 + rank) over the lists a chunk appears in.
     # Ranks, not raw scores, so a cosine 0.4 and a BM25 12.0 can be merged fairly.
     fused = {}
-    for name, hits in (("vector", vec), ("bm25", bm25_search(query, CANDIDATES, want))):
+    for name, hits in (("vector", vec), ("bm25", bm25_search(query, pool_size, want))):
         for rank, h in enumerate(hits, 1):
             f = fused.setdefault(h["id"], {"source": h["source"], "text": h["text"], "rrf": 0.0, "cos": 0.0, "found": []})
             f["rrf"] += 1 / (RRF_K + rank)
@@ -465,9 +470,104 @@ def retrieve(query, k=K):
             if name == "vector":
                 f["cos"] = h["score"]                  # keep the cosine as the score (STEP 6 uses it)
     pool = [{"source": h["source"], "text": h["text"], "score": h["cos"], "rrf": round(h["rrf"], 4),
-             "via": " + ".join(h["found"])} for h in sorted(fused.values(), key=lambda h: -h["rrf"])[:CANDIDATES]]
-    best = rerank(query, pool, k) if RERANK else pool[:k]
+             "via": " + ".join(h["found"])} for h in sorted(fused.values(), key=lambda h: -h["rrf"])[:pool_size]]
+    best = rerank(judge, pool, k) if RERANK else pool[:k]
     return [dict(h, rank=i + 1) for i, h in enumerate(best)]
+
+
+# ================================================================= LEVEL 5 · AGENTIC RAG
+# The agent ROUTES the question to a strategy, EVALUATES the evidence it got back, and RETRIES
+# with another query or strategy when the evidence is weak. Every step goes into AGENT_TRACE and
+# into the "via" column, so you can see what it decided.
+AGENT = True              # LEVEL 5: False = one search, as in step 7
+STRONG = -4.0             # reranker score of the best chunk that counts as good evidence
+MAX_RETRIES = 1           # each retry is one more search + rerank (~200 ms)
+AGENT_TRACE = []
+QUESTION_WORDS = STOP | set("who whose which what where when how many much any all list find show give tell me us "
+                            "candidate candidates person people someone anyone has have had having know knows "
+                            "experience experienced worked work working used use using can could would".split())
+
+
+def named_candidate(question):
+    """The CV a question is about, when it names one candidate: their full name, two of their
+    name words, or a first name only one candidate has."""
+    people = {c["source"]: c.get("name", "") for c in BM25["chunks"] if c.get("name")}
+    words = set(re.findall(r"[a-z]+", question.lower()))
+    first = collections.Counter(n.split()[0].lower() for n in people.values() if n.split())
+    found = []
+    for source, name in people.items():
+        parts = [p for p in re.findall(r"[a-z]+", name.lower()) if len(p) > 2]
+        hit = sum(p in words for p in parts)
+        if name.lower() in question.lower() or hit >= 2 or (hit == 1 and parts and parts[0] in words and first[parts[0]] == 1):
+            found.append(source)
+    return found[0] if len(found) == 1 else None
+
+
+def keywords(question):
+    """The content words of a question: "Who has experience with Kestra?" → "kestra"."""
+    return " ".join(w for w in re.findall(r"[\w+#.-]+", question) if w.lower() not in QUESTION_WORDS)
+
+
+def strength(hits):
+    return hits[0].get("rerank", 0.0) if hits else float("-inf")
+
+
+def unknown_terms(question):
+    """Named things the question asks about (a capitalised word or a known skill) that no CV
+    contains at all: "Who knows Rust?" → ["Rust"] when no chunk has the word "rust"."""
+    vocab = BM25["idf"]
+    words = re.findall(r"[\w+#.-]+", question)[1:]           # the first word is capitalised anyway
+    named = [w for w in words if (w[0].isupper() or w.lower() in SKILLS) and w.lower() not in QUESTION_WORDS]
+    return [w for w in named if tokenize(w) and not all(t in vocab for t in tokenize(w))]
+
+
+def retrieve(query, k=K):
+    """Return the k best chunks: [{"rank": 1, "source": ..., "text": ..., "score": ..., "via": "vector"}, ...]"""
+    AGENT_TRACE.clear()
+    if not AGENT:
+        route = graph_route(query)
+        return graph_hits(query, route) if route else search(query, k, question_filters(query) if FILTERS else {})
+    # 1 · ROUTE
+    route = graph_route(query)
+    if route:
+        hits = graph_hits(query, route)
+        AGENT_TRACE.append(f"route: list → graph ({len(hits)} candidates)")
+        if hits:                                       # 2 · EVALUATE: the graph found people
+            return hits
+        AGENT_TRACE.append("evaluate: graph found nobody → normal search")
+    want = question_filters(query) if FILTERS else {}
+    person = named_candidate(query)
+    if person:
+        want["source"] = person
+    plan = "named candidate " + person if person else "filters " + str(want) if want else "general search"
+    attempts = [(f"route: {plan}", search(query, k, want))]
+    # 2 · EVALUATE: weak evidence about something no CV even mentions → no evidence at all
+    missing = unknown_terms(query)
+    if missing and strength(attempts[0][1]) < STRONG:
+        AGENT_TRACE.append(f"{attempts[0][0]} → best score {strength(attempts[0][1]):.2f}")
+        AGENT_TRACE.append(f"evaluate: no CV mentions {', '.join(missing)} → nothing to answer from")
+        return []
+    # 3 · RETRY while the evidence is weak
+    if strength(attempts[-1][1]) < STRONG:
+        tries = []
+        if person:
+            tries.append(("retry: without the name restriction", query, {k2: v for k2, v in want.items() if k2 != "source"}, None))
+        kw = keywords(query)
+        if kw and kw.lower() != query.lower():
+            tries.append((f"retry: keywords '{kw}'", kw, want, None))
+        for label, q2, w2, hyb in tries[:MAX_RETRIES]:
+            attempts.append((label, search(q2, k, w2, judge=query, hybrid=hyb)))
+            if strength(attempts[-1][1]) >= STRONG:
+                break
+    for label, hits in attempts:
+        AGENT_TRACE.append(f"{label} → best score {strength(hits):.2f}")
+    # A retry replaces the first answer only when it found STRONG evidence: a slightly less
+    # bad chunk for an unanswerable question must not sneak past the refusal (step 6).
+    label, best = max(attempts, key=lambda a: strength(a[1]))
+    if strength(best) < STRONG:
+        label, best = attempts[0]
+    AGENT_TRACE.append(f"keep: {label}")
+    return [dict(h, via=f"{label} · {h.get('via', '')}") for h in best]
 
 
 def build_prompt(question, hits):
