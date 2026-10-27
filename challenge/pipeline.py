@@ -231,9 +231,30 @@ def build_prompt(question, hits):
 # ================================================================= LEVEL 4 · FEATURES
 # These already work in their simplest form. Each step of the menu replaces one of them
 # (or retrieve / chunk above). One step at a time, then Verify.
+FOLLOW_UP = re.compile(r"^\s*(and|also|what about|how about)\b|\b(he|she|him|her|his|hers|they|them|their|"
+                       r"this (person|candidate|one)|that (person|candidate|one)|the same (person|candidate))\b", re.I)
+REWRITE_PROMPT = ("Rewrite the user's last question so it can be understood without the earlier questions: "
+                  "replace pronouns like he, she or that candidate with who they refer to. "
+                  "Reply with the rewritten question only.")
+
+
 def make_query(question, history):
     """STEP 1 · Follow-ups: rewrite "and where did he study?" using `history` (earlier questions)."""
-    return question
+    if not history or not FOLLOW_UP.search(question):
+        return question                               # a stand-alone question: search it as it is
+    previous = history[-1]
+    try:
+        from helpers import llm
+        from ragkit import get_llm                    # the same shared model llm() uses
+        if getattr(get_llm(), "can_reason", True):    # the offline fallback cannot rewrite
+            earlier = "\n".join(f"- {q}" for q in history[-3:])
+            rewritten = llm(REWRITE_PROMPT, f"Earlier questions:\n{earlier}\n\nLast question: {question}", 60).strip()
+            if 0 < len(rewritten) < 300:
+                return rewritten
+    except Exception as e:
+        print("make_query: LLM rewrite failed, using the rule:", e)
+    # Rule: the person is named or described in the previous question, so search both together.
+    return f"{previous} {question}"
 
 
 def should_refuse(query, hits):
