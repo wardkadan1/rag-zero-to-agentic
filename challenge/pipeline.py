@@ -217,6 +217,76 @@ def candidate_name(source, text):
     return name.title() if name.isupper() else name
 
 
+# ----------------------------------------------------------------- STEP 5 · facts for metadata filters
+CITIES = ["Tel Aviv", "Jerusalem", "Haifa", "Nazareth", "Be'er Sheva", "Beer Sheva", "Beersheba", "Netanya", "Herzliya",
+          "Ra'anana", "Raanana", "Petah Tikva", "Rishon LeZion", "Holon", "Ashdod", "Ashkelon", "Rehovot", "Kfar Saba",
+          "Hadera", "Acre", "Akko", "Karmiel", "Afula", "Nahariya", "Jaffa", "Ramat Gan", "Bnei Brak", "Bat Yam",
+          "Modiin", "Yokneam", "Tiberias", "Safed", "Eilat", "Lod", "Ramla", "Rahat", "Umm al-Fahm", "Sakhnin", "Tamra",
+          "Shefa-Amr", "Tayibe", "Tira", "Kafr Qasim", "Kafr Qara", "Baqa al-Gharbiyye", "Qalansawe", "Arraba", "Kafr Kanna",
+          "Daliyat al-Karmel", "Isfiya", "Jatt", "Ramallah", "Bethlehem", "Nablus", "Amman"]
+CITY_ALIASES = {"Beer Sheva": "Be'er Sheva", "Beersheba": "Be'er Sheva", "Raanana": "Ra'anana", "Akko": "Acre"}
+MONTHS = {m: i for i, m in enumerate("jan feb mar apr may jun jul aug sep oct nov dec".split(), 1)}
+MONTH = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*"
+DATE = rf"(?:\b({MONTH})\.?[ \t]*|\b(\d{{1,2}})/)?((?:19|20)\d\d)"
+RANGE = re.compile(DATE + r"[ \t]*[-–—]+[ \t]*(?:" + DATE + r"|(present|current|now|today))", re.I)
+STUDY = re.compile(r"universit|college|b\.?sc|m\.?sc|bachelor|master|degree|gpa|student|school|graduat|course|"
+                   r"program|academ|education|diploma|thesis|ph\.?d|institute|certific|high school|bagrut", re.I)
+
+
+HEADING = re.compile(r"^\W*(?:[A-Za-z&]+[ \t]+){0,2}(?:education|experience|employment|work|volunteer\w*|certific\w*|"
+                     r"courses?|projects?|training|awards?|honors?)\w*(?:[ \t]+[A-Za-z&]+){0,2}\W*$", re.I | re.M)   # section titles
+NOT_WORK = re.compile(r"education|volunteer|certific|course|project|training|award|honor", re.I)
+
+
+def find_city(text):
+    """The city the CV lists for the candidate: looked for only in the header (first 300
+    characters) or right after "Address"/"Location", so "Tel Aviv University" does not count."""
+    places = [text[:300]] + [m.group(1) for m in re.finditer(r"(?:address|location|lives in|📍)\W{0,3}([\s\S]{0,80})", text, re.I)]
+    for place in places:
+        for city in CITIES:
+            m = re.search(rf"\b{re.escape(city)}\b(?!\s+(?:University|College|Institute))", place, re.I)
+            if m:
+                return CITY_ALIASES.get(city, city)
+    return ""
+
+
+def years_of_experience(text):
+    """Years of work experience: the CV's own "N+ years of experience" if it says so, else the
+    job date ranges added up (overlaps counted once, study periods left out)."""
+    import datetime
+    said = [int(n) for n in re.findall(r"(\d{1,2})\+?\s*years?\s+(?:of\s+)?(?:\w+\s+){0,2}(?:experience|leading|working)", text, re.I)]
+    if said:
+        return float(max(said))
+    today = datetime.date.today()
+    def month(name, num, year, default):
+        m = MONTHS.get((name or "")[:3].lower()) or (int(num) if num and 1 <= int(num) <= 12 else default)
+        return int(year) * 12 + m - 1
+    spans = []
+    for r in RANGE.finditer(text):
+        line_start = text.rfind("\n", 0, r.start()) + 1
+        line_end = text.find("\n", r.end())
+        line_end = len(text) if line_end < 0 else line_end
+        if not re.search(r"\w", text[r.end():line_end]):  # the date ends its line: what it is, is on the next line
+            nxt = text.find("\n", line_end + 1)
+            line_end = len(text) if nxt < 0 else nxt
+        heading = [h for h in HEADING.finditer(text, 0, r.start())]
+        if STUDY.search(text[line_start:line_end]) or (heading and NOT_WORK.search(heading[-1].group())):
+            continue
+        start = month(r.group(1), r.group(2), r.group(3), 1)
+        end = today.year * 12 + today.month - 1 if r.group(7) else month(r.group(4), r.group(5), r.group(6), 12)
+        if start < end <= today.year * 12 + today.month:
+            spans.append((start, end))
+    total, last = 0, None
+    for a, b in sorted(spans):                         # merge overlapping jobs
+        if last is None or a > last[1]:
+            total += (last[1] - last[0]) if last else 0
+            last = [a, b]
+        else:
+            last[1] = max(last[1], b)
+    total += (last[1] - last[0]) if last else 0
+    return round(total / 12, 1)
+
+
 def chunk(doc):
     """Split ONE document into chunks.
     Return [{"id": "<unique id>", "source": doc["source"], "text": "<chunk text>"}, ...]
@@ -225,12 +295,13 @@ def chunk(doc):
     matches a question that names the candidate."""
     text, step = doc["text"], CHUNK_SIZE - CHUNK_OVERLAP
     name = candidate_name(doc["source"], text)
+    facts = {"name": name, "city": find_city(text), "years": years_of_experience(text)}   # STEP 5 metadata
     head = f"CV of {name}:\n" if name else ""
     chunks = []
     for start in range(0, max(len(text) - CHUNK_OVERLAP, 1), step):
         piece = text[start:start + CHUNK_SIZE]
         if piece.strip():
-            chunks.append({"id": f"{doc['source']}#{len(chunks)}", "source": doc["source"], "name": name,
+            chunks.append({"id": f"{doc['source']}#{len(chunks)}", "source": doc["source"], **facts,
                            "text": head + piece})
     return chunks
 
@@ -282,10 +353,12 @@ def build_bm25(chunks, k1=1.5, b=0.75):
                 idf={t: math.log((n - f + 0.5) / (f + 0.5) + 1) for t, f in df.items()})
 
 
-def bm25_search(query, n):
+def bm25_search(query, n, want=None):
     """The n chunks with the best BM25 score (a word scores more when it is rare across the CVs)."""
     q, scores = tokenize(query), []
     for i, tf in enumerate(BM25["tf"]):
+        if want and not meets(BM25["chunks"][i], want):
+            continue
         norm = BM25["k1"] * (1 - BM25["b"] + BM25["b"] * BM25["len"][i] / BM25["avg"])
         s = sum(BM25["idf"][t] * tf[t] * (BM25["k1"] + 1) / (tf[t] + norm) for t in q if tf.get(t))
         if s > 0:
@@ -303,13 +376,37 @@ CANDIDATES = 20           # how many each search brings to the fusion
 RRF_K = 60
 
 
-def vector_search(query, n):
-    res = COLLECTION.query(query_embeddings=embed([query]).tolist(), n_results=min(n, COLLECTION.count()))
+def question_filters(question):
+    """STEP 5 · The hard requirements a question states: a city it names, a minimum of years
+    ("5+ years", "at least 5 years", "5 or more years"). {} when it states none."""
+    want = {}
+    for city in CITIES:
+        if re.search(rf"\b{re.escape(city)}\b", question, re.I):
+            want["city"] = CITY_ALIASES.get(city, city)
+            break
+    m = re.search(r"(?:at least|minimum(?: of)?|more than|over)\s+(\d{1,2})\s*years?|(\d{1,2})\s*(?:\+|or more|plus)\s*years?", question, re.I)
+    if m:
+        want["years"] = int(m.group(1) or m.group(2))
+    return want
+
+
+def chroma_where(want):
+    parts = ([{"city": want["city"]}] if "city" in want else []) + ([{"years": {"$gte": want["years"]}}] if "years" in want else [])
+    return None if not parts else parts[0] if len(parts) == 1 else {"$and": parts}
+
+
+def meets(chunk, want):
+    return chunk.get("city") == want.get("city", chunk.get("city")) and chunk.get("years", 0) >= want.get("years", 0)
+
+
+def vector_search(query, n, where=None):
+    res = COLLECTION.query(query_embeddings=embed([query]).tolist(), n_results=min(n, COLLECTION.count()), where=where)
     return [{"id": cid, "source": meta["source"], "text": text, "score": 1 - dist}
             for cid, text, meta, dist in zip(res["ids"][0], res["documents"][0], res["metadatas"][0], res["distances"][0])]
 
 
 RERANK = True             # STEP 4: False = keep the fusion order (to compare in Verify)
+FILTERS = True            # STEP 5: False = no city / years filters
 RERANKER = None
 
 
@@ -334,7 +431,10 @@ def rerank(query, pool, k):
 def retrieve(query, k=K):
     """Return the k best chunks: [{"rank": 1, "source": ..., "text": ..., "score": ..., "via": "vector"}, ...]"""
     pool_size = CANDIDATES if (HYBRID or RERANK) else k
-    vec = vector_search(query, pool_size)
+    want = question_filters(query) if FILTERS else {}
+    if want:
+        print("filters:", want)
+    vec = vector_search(query, pool_size, chroma_where(want))
     if not HYBRID:
         pool = [dict(h, via=f"vector #{i}") for i, h in enumerate(vec, 1)]
         best = rerank(query, pool, k) if RERANK else pool[:k]
@@ -342,7 +442,7 @@ def retrieve(query, k=K):
     # Reciprocal Rank Fusion: score = sum of 1/(60 + rank) over the lists a chunk appears in.
     # Ranks, not raw scores, so a cosine 0.4 and a BM25 12.0 can be merged fairly.
     fused = {}
-    for name, hits in (("vector", vec), ("bm25", bm25_search(query, CANDIDATES))):
+    for name, hits in (("vector", vec), ("bm25", bm25_search(query, CANDIDATES, want))):
         for rank, h in enumerate(hits, 1):
             f = fused.setdefault(h["id"], {"source": h["source"], "text": h["text"], "rrf": 0.0, "cos": 0.0, "found": []})
             f["rrf"] += 1 / (RRF_K + rank)
