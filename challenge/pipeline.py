@@ -256,18 +256,77 @@ def build_index(chunks):
                        documents=[c["text"] for c in batch],
                        metadatas=[{k: v for k, v in c.items() if k not in ("id", "text")} for c in batch],
                        embeddings=embed([c["text"] for c in batch]).tolist())
+    build_bm25(chunks)
     return COLLECTION.count()
+
+
+# ----------------------------------------------------------------- STEP 3 · BM25 keyword search
+# Vector search finds similar MEANING; BM25 finds the exact WORDS (names, tools, certificates).
+STOP = set("a an and are as at be by did do does for from has have he her his in is it its of on or she that the "
+           "their they this to was were what which who whom with candidate candidates cv".split())
+BM25 = {"chunks": [], "tf": [], "len": [], "idf": {}, "avg": 1.0}
+
+
+def tokenize(text):
+    """Lowercase words; keeps tech words like c++, c#, node.js and ci/cd pieces whole."""
+    return [t for t in re.findall(r"[a-z0-9]+(?:[+#]+|(?:[.][a-z0-9]+)+)?", text.lower()) if t not in STOP]
+
+
+def build_bm25(chunks, k1=1.5, b=0.75):
+    import collections, math
+    docs = [tokenize(c["text"]) for c in chunks]
+    df = collections.Counter(t for d in docs for t in set(d))
+    n = len(docs)
+    BM25.update(chunks=chunks, tf=[collections.Counter(d) for d in docs], len=[len(d) for d in docs],
+                avg=sum(map(len, docs)) / max(n, 1), k1=k1, b=b,
+                idf={t: math.log((n - f + 0.5) / (f + 0.5) + 1) for t, f in df.items()})
+
+
+def bm25_search(query, n):
+    """The n chunks with the best BM25 score (a word scores more when it is rare across the CVs)."""
+    q, scores = tokenize(query), []
+    for i, tf in enumerate(BM25["tf"]):
+        norm = BM25["k1"] * (1 - BM25["b"] + BM25["b"] * BM25["len"][i] / BM25["avg"])
+        s = sum(BM25["idf"][t] * tf[t] * (BM25["k1"] + 1) / (tf[t] + norm) for t in q if tf.get(t))
+        if s > 0:
+            scores.append((s, i))
+    return [{"id": BM25["chunks"][i]["id"], "source": BM25["chunks"][i]["source"], "text": BM25["chunks"][i]["text"],
+             "score": s} for s, i in sorted(scores, reverse=True)[:n]]
 
 
 # ================================================================= LEVEL 3 · RETRIEVE AND PROMPT
 # Prompt idea: "Implement retrieve: embed the query, query the Chroma collection for k results,
 #  and return them as dicts with rank, source, text, score (1 - distance) and via='vector'.
 #  Implement build_prompt: number the passages [1], [2]… with their source, then the question."
+HYBRID = True             # STEP 3: False = vector search only (to compare in Verify)
+CANDIDATES = 20           # how many each search brings to the fusion
+RRF_K = 60
+
+
+def vector_search(query, n):
+    res = COLLECTION.query(query_embeddings=embed([query]).tolist(), n_results=min(n, COLLECTION.count()))
+    return [{"id": cid, "source": meta["source"], "text": text, "score": 1 - dist}
+            for cid, text, meta, dist in zip(res["ids"][0], res["documents"][0], res["metadatas"][0], res["distances"][0])]
+
+
 def retrieve(query, k=K):
     """Return the k best chunks: [{"rank": 1, "source": ..., "text": ..., "score": ..., "via": "vector"}, ...]"""
-    res = COLLECTION.query(query_embeddings=embed([query]).tolist(), n_results=min(k, COLLECTION.count()))
-    return [{"rank": i + 1, "source": meta["source"], "text": text, "score": 1 - dist, "via": "vector"}
-            for i, (text, meta, dist) in enumerate(zip(res["documents"][0], res["metadatas"][0], res["distances"][0]))]
+    vec = vector_search(query, CANDIDATES if HYBRID else k)
+    if not HYBRID:
+        return [dict(h, rank=i + 1, via="vector") for i, h in enumerate(vec)]
+    # Reciprocal Rank Fusion: score = sum of 1/(60 + rank) over the lists a chunk appears in.
+    # Ranks, not raw scores, so a cosine 0.4 and a BM25 12.0 can be merged fairly.
+    fused = {}
+    for name, hits in (("vector", vec), ("bm25", bm25_search(query, CANDIDATES))):
+        for rank, h in enumerate(hits, 1):
+            f = fused.setdefault(h["id"], {"source": h["source"], "text": h["text"], "rrf": 0.0, "cos": 0.0, "found": []})
+            f["rrf"] += 1 / (RRF_K + rank)
+            f["found"].append(f"{name} #{rank}")
+            if name == "vector":
+                f["cos"] = h["score"]                  # keep the cosine as the score (STEP 6 uses it)
+    best = sorted(fused.values(), key=lambda h: -h["rrf"])[:k]
+    return [{"rank": i + 1, "source": h["source"], "text": h["text"], "score": h["cos"], "rrf": round(h["rrf"], 4),
+             "via": " + ".join(h["found"])} for i, h in enumerate(best)]
 
 
 def build_prompt(question, hits):
