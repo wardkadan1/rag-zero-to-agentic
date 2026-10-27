@@ -309,11 +309,36 @@ def vector_search(query, n):
             for cid, text, meta, dist in zip(res["ids"][0], res["documents"][0], res["metadatas"][0], res["distances"][0])]
 
 
+RERANK = True             # STEP 4: False = keep the fusion order (to compare in Verify)
+RERANKER = None
+
+
+def rerank(query, pool, k):
+    """STEP 4 · A cross-encoder reads the question and each chunk TOGETHER and scores the pair:
+    slower than comparing two vectors, so only the pool of candidates gets it."""
+    global RERANKER
+    import time
+    if RERANKER is None:
+        from ragkit import Reranker
+        RERANKER = Reranker()
+    if RERANKER.model is None or not pool:
+        return pool[:k]
+    t = time.perf_counter()
+    scores = RERANKER.model.predict([(query, h["text"]) for h in pool])
+    for h, sc in zip(pool, scores):
+        h["rerank"] = round(float(sc), 3)
+    print(f"rerank: {len(pool)} chunks in {(time.perf_counter() - t) * 1000:.0f} ms")
+    return sorted(pool, key=lambda h: -h["rerank"])[:k]
+
+
 def retrieve(query, k=K):
     """Return the k best chunks: [{"rank": 1, "source": ..., "text": ..., "score": ..., "via": "vector"}, ...]"""
-    vec = vector_search(query, CANDIDATES if HYBRID else k)
+    pool_size = CANDIDATES if (HYBRID or RERANK) else k
+    vec = vector_search(query, pool_size)
     if not HYBRID:
-        return [dict(h, rank=i + 1, via="vector") for i, h in enumerate(vec)]
+        pool = [dict(h, via=f"vector #{i}") for i, h in enumerate(vec, 1)]
+        best = rerank(query, pool, k) if RERANK else pool[:k]
+        return [dict(h, rank=i + 1) for i, h in enumerate(best)]
     # Reciprocal Rank Fusion: score = sum of 1/(60 + rank) over the lists a chunk appears in.
     # Ranks, not raw scores, so a cosine 0.4 and a BM25 12.0 can be merged fairly.
     fused = {}
@@ -324,9 +349,10 @@ def retrieve(query, k=K):
             f["found"].append(f"{name} #{rank}")
             if name == "vector":
                 f["cos"] = h["score"]                  # keep the cosine as the score (STEP 6 uses it)
-    best = sorted(fused.values(), key=lambda h: -h["rrf"])[:k]
-    return [{"rank": i + 1, "source": h["source"], "text": h["text"], "score": h["cos"], "rrf": round(h["rrf"], 4),
-             "via": " + ".join(h["found"])} for i, h in enumerate(best)]
+    pool = [{"source": h["source"], "text": h["text"], "score": h["cos"], "rrf": round(h["rrf"], 4),
+             "via": " + ".join(h["found"])} for h in sorted(fused.values(), key=lambda h: -h["rrf"])[:CANDIDATES]]
+    best = rerank(query, pool, k) if RERANK else pool[:k]
+    return [dict(h, rank=i + 1) for i, h in enumerate(best)]
 
 
 def build_prompt(question, hits):
