@@ -142,17 +142,26 @@ def load_cvs(folder):
     `source` must be the FILE NAME: Verify checks retrieval against it.
     Exact duplicate files and files without text are left out, and every file gets a row in
     INGEST_REPORT (printed to the console), so nothing is skipped silently."""
-    import hashlib
+    from security import ingest_guard                 # SECURITY · Phase 1: every file is judged before a parser opens it
     INGEST_REPORT.clear()
-    paths = [p for p in sorted(pathlib.Path(folder).iterdir()) if p.is_file() and p.suffix.lower() in CV_TYPES]
-    digest = {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
+    checked = ingest_guard.gate(folder, CV_TYPES)
+    digest = {path: d.sha256 for path, d in checked if d.ingest}
     keep = {}                                          # one file per content: the shortest name ("CV.pdf", not "CV 2.pdf")
-    for path in sorted(paths, key=lambda p: (len(p.name), p.name)):
+    for path in sorted(digest, key=lambda p: (len(p.name), p.name)):
         keep.setdefault(digest[path], path.name)
     docs = []
-    for path in paths:
-        row = {"source": path.name, "status": "ok", "chars": 0, "detail": ""}
+    for path, decision in checked:
+        row = {"source": path.name, "status": "ok", "chars": 0, "detail": "", "flags": decision.flags}
         INGEST_REPORT.append(row)
+        if decision.status == "block":
+            row.update(status="blocked", detail="not opened: " + ", ".join(decision.reasons))
+            continue
+        if not decision.ingest:
+            row.update(status="quarantined", detail="waiting for a person's decision: " + ", ".join(decision.flags)
+                       if decision.review != "reject" else "rejected by a person's decision")
+            continue
+        if decision.flags:                             # report-only: still ingested, listed for review
+            row["detail"] = "flagged (report-only): " + ", ".join(decision.flags)
         if keep[digest[path]] != path.name:
             row.update(status="duplicate", detail=f"same bytes as {keep[digest[path]]}: not indexed twice")
             continue
@@ -180,7 +189,7 @@ def print_ingest_report():
         counts[row["status"]] = counts.get(row["status"], 0) + 1
     print("Ingestion: " + ", ".join(f"{n} {status}" for status, n in counts.items()))
     for row in INGEST_REPORT:
-        if row["status"] != "ok":
+        if row["status"] != "ok" or row.get("flags"):
             print(f"  {row['status'].upper():9} {row['source']}: {row['detail']}")
 
 
