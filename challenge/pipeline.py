@@ -206,8 +206,10 @@ def load_cvs(folder):
 def content_checks(checked, parsed):
     """SECURITY · Phase 3 · what the parsed text says, before anything is indexed. A high finding
     (instructions to an AI, invisible skill lists) quarantines the file: it never reaches Chroma,
-    BM25 or the graph. A medium finding is a flag for a person; the file is still indexed. The
-    checks read a normalized COPY of the text; the text that is indexed is not changed."""
+    BM25 or the graph, and no decision overrides that. A medium finding is a flag for a person:
+    report mode still indexes the file; enforce mode (SECURITY_MODE=enforce) holds it back
+    until decisions.json accepts it. The checks read a normalized COPY of the text; the text
+    that is indexed is not changed."""
     from security import content, ingest_guard
     texts = {}
     for path, d in checked:
@@ -215,8 +217,13 @@ def content_checks(checked, parsed):
         if not d.ingest or not result or not result["ok"]:
             continue
         hidden = result.get("hidden") or {}
-        if "unavailable" in hidden:
-            ingest_guard.flag(d, "pdf_render_check_unavailable:" + str(hidden["unavailable"])[:40])
+        if d.kind == "pdf" and not isinstance(hidden.get("chars"), int):
+            # the render-aware check did not run (library missing, or it failed on this file):
+            # enforce mode fails closed and never indexes the PDF; report mode flags it
+            why = "pdf_render_check_unavailable:" + str(hidden.get("unavailable", "no_result"))[:40]
+            (ingest_guard.quarantine if ingest_guard.mode() == "enforce" else ingest_guard.flag)(d, why)
+            if not d.ingest:
+                continue
         findings = (content.hidden_verdict(hidden, SKILL_RE) + content.scan_injection(result["text"])
                     + content.scan_stuffing(result["text"], SKILL_RE, STOP))
         for level, code in findings:

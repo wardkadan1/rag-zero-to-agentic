@@ -62,9 +62,10 @@ class Decision:
 
     @property
     def verdict(self):
-        """Phase 3: the one word a person reads. accepted · flagged (indexed, please review) ·
-        quarantined (not indexed: blocked, unsafe, malicious, waiting for or rejected by a person)."""
-        if not self.ingest:
+        """Phase 3: the one word a person reads. accepted · flagged (a person should review it:
+        indexed in report mode, held back until accepted in enforce mode) · quarantined (never
+        indexed: blocked, unsafe to parse, malicious, or rejected by a person)."""
+        if self.status in ("block", "quarantine") or self.review == "reject":
             return "quarantined"
         return "flagged" if self.flags else "accepted"
 
