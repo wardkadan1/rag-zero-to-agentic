@@ -44,7 +44,16 @@ def read_pdf(path):
     import logging
     from pypdf import PdfReader
     logging.getLogger("pypdf").setLevel(logging.ERROR)    # hide "wrong pointing object" noise
-    return "\n".join(page.extract_text() or "" for page in PdfReader(path).pages)
+    pages = []
+    for page in PdfReader(path).pages:
+        text = page.extract_text() or ""
+        lines = [l for l in text.splitlines() if l.strip()]
+        if lines and sum(len(l.split()) == 1 for l in lines) / len(lines) > 0.5:
+            # one word per line: this PDF stores every word apart. Layout mode rebuilds the lines
+            # from the word positions (only here: on multi-column pages it mixes the columns).
+            text = page.extract_text(extraction_mode="layout") or text
+        pages.append(text)
+    return "\n".join(pages)
 
 
 def docx_paragraph(element):
@@ -174,16 +183,55 @@ def print_ingest_report():
             print(f"  {row['status'].upper():9} {row['source']}: {row['detail']}")
 
 
+NOT_NAME = {"cv", "resume", "curriculum", "vitae", "general", "final", "new", "updated", "docx", "pdf", "doc", "my",
+            "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"}
+NOT_NAME_WORDS = NOT_NAME | {"name", "title", "profile", "summary", "software", "engineer", "developer", "contact",
+                             "experience", "education", "skills", "student", "graduate", "manager", "email", "phone"}
+
+
+def candidate_name(source, text):
+    """The candidate's name, as the CV writes it. First the words of the file name
+    ("Ward_Keadan_cv.pdf" → Ward, Keadan) found close together in the text; else a short
+    line of capitalized words near the top. "" when neither works."""
+    stem = pathlib.Path(source).stem
+    tokens = [t for t in re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])", stem) if len(t) > 1 and t.lower() not in NOT_NAME]
+    found = sorted(m.span() for t in tokens for m in [re.search(rf"\b{re.escape(t)}\b", text, re.I)] if m)
+    name = ""
+    if found:
+        start, end = found[0]
+        for s, e in found[1:]:
+            if s - end > 40:
+                break
+            end = max(end, e)
+        if end == found[0][1]:                         # one word only ("FadiCV.pdf"): it needs a surname after it
+            nxt = re.match(r" ([A-Z][\w'-]+)", text[end:end + 40])
+            end = end + nxt.end() if nxt and nxt.group(1).lower() not in NOT_NAME_WORDS else start
+        name = re.sub(r"\s+", " ", text[start:end]).strip(" |·-")
+    if not name:
+        for part in re.split(r"[\n:|·•,]", re.sub(r"\([^)]*\)", "", text[:400])):
+            words = part.split()
+            if 2 <= len(words) <= 4 and all(re.fullmatch(r"[A-Z][\w.'-]*", w) for w in words) \
+                    and not any(w.lower() in NOT_NAME_WORDS for w in words):
+                name = " ".join(words)
+                break
+    return name.title() if name.isupper() else name
+
+
 def chunk(doc):
     """Split ONE document into chunks.
     Return [{"id": "<unique id>", "source": doc["source"], "text": "<chunk text>"}, ...]
-    You may add more keys (they become metadata), e.g. "name", "section", "city"."""
+    You may add more keys (they become metadata), e.g. "name", "section", "city".
+    Every chunk starts with whose CV it is, so a chunk from the middle of a CV still
+    matches a question that names the candidate."""
     text, step = doc["text"], CHUNK_SIZE - CHUNK_OVERLAP
+    name = candidate_name(doc["source"], text)
+    head = f"CV of {name}:\n" if name else ""
     chunks = []
     for start in range(0, max(len(text) - CHUNK_OVERLAP, 1), step):
         piece = text[start:start + CHUNK_SIZE]
         if piece.strip():
-            chunks.append({"id": f"{doc['source']}#{len(chunks)}", "source": doc["source"], "text": piece})
+            chunks.append({"id": f"{doc['source']}#{len(chunks)}", "source": doc["source"], "name": name,
+                           "text": head + piece})
     return chunks
 
 
