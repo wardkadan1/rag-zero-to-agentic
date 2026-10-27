@@ -2,6 +2,7 @@
 
     .venv/bin/python -m pytest -q challenge/security/tests
 """
+import hashlib
 import io
 import json
 import os
@@ -265,3 +266,72 @@ def test_report_holds_reason_codes_never_cv_text(tmp_path):
     pipeline.load_cvs(d)
     text = (tmp_path / "quarantine.json").read_text()
     assert "SECRET-PHRASE" not in text and "@" not in text and "555" not in text
+
+
+# ------------------------------------------------------------------ TOCTOU: the gate judges only the bytes it hashed
+def swap_before_zip_check(monkeypatch, path, new_bytes):
+    real = G.check_zip
+
+    def swapping(d, data):
+        path.write_bytes(new_bytes)                    # the attacker replaces the file after it was read
+        return real(d, data)
+    monkeypatch.setattr(G, "check_zip", swapping)
+
+
+def test_zip_checks_use_the_hashed_bytes_not_the_swapped_file(tmp_path, monkeypatch):
+    d = cvdir(tmp_path)
+    make_docx(d / "Omar_Saleh.docx")
+    original = (d / "Omar_Saleh.docx").read_bytes()
+    make_docx_bomb(tmp_path / "bomb.docx")
+    swap_before_zip_check(monkeypatch, d / "Omar_Saleh.docx", (tmp_path / "bomb.docx").read_bytes())
+    docs = pipeline.load_cvs(d)
+    row = rows()["Omar_Saleh.docx"]
+    assert row["status"] == "ok" and report(tmp_path) == {}
+    assert docs[0]["text"] == pipeline.normalize(pipeline.read_bytes("docx", original))   # parsed == validated
+
+
+def test_a_bomb_stays_blocked_when_swapped_for_a_valid_file(tmp_path, monkeypatch):
+    d = cvdir(tmp_path)
+    make_docx_bomb(d / "Bomb_CV.docx")
+    make_docx(tmp_path / "valid.docx")
+    swap_before_zip_check(monkeypatch, d / "Bomb_CV.docx", (tmp_path / "valid.docx").read_bytes())
+    (d / "Real_CV.txt").write_text(CV_TEXT)
+    pipeline.load_cvs(d)
+    assert rows()["Bomb_CV.docx"]["status"] == "blocked" and "zip_ratio" in rows()["Bomb_CV.docx"]["detail"]
+
+
+def test_validated_bytes_are_exactly_the_parsed_bytes(tmp_path, monkeypatch):
+    from security import sandbox
+    d = cvdir(tmp_path)
+    make_docx(d / "a.docx")
+    make_pdf(d / "b.pdf")
+    (d / "c.txt").write_text(CV_TEXT)
+    seen = {}
+    real = sandbox.parse_all
+
+    def recording(jobs, **kw):
+        seen.update({key: (sha, hashlib.sha256(data).hexdigest()) for key, kind, sha, data in jobs})
+        return real(jobs, **kw)
+    monkeypatch.setattr(sandbox, "parse_all", recording)
+    checked = dict((p.name, x.sha256) for p, x in G.gate(d, pipeline.CV_TYPES))
+    pipeline.load_cvs(d)
+    assert seen and all(gate_sha == sent_sha == checked[k] for k, (gate_sha, sent_sha) in seen.items())
+
+
+def test_regular_file_swapped_for_an_outside_link_after_lstat_is_blocked(tmp_path, monkeypatch):
+    d = cvdir(tmp_path)
+    (d / "A_CV.txt").write_text(CV_TEXT)
+    secret = tmp_path / "secret.txt"
+    secret.write_text("API_KEY=sk-test-123 " * 30)
+    real_lstat, swapped = os.lstat, []
+
+    def lstat_then_swap(p, *a, **kw):
+        st = real_lstat(p, *a, **kw)
+        if str(p).endswith("A_CV.txt") and not swapped:
+            swapped.append(1)
+            os.remove(p)
+            os.symlink(secret, p)                      # swapped between the check and the open
+        return st
+    monkeypatch.setattr(G.os, "lstat", lstat_then_swap)
+    x = G.decide(d / "A_CV.txt", d)
+    assert x.status == "block" and not x.snapshot and x.sha256 == ""

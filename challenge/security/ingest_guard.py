@@ -17,11 +17,13 @@ Nothing here reads or prints CV text: only file names, sizes, hashes and reason 
 """
 import dataclasses
 import hashlib
+import io
 import json
 import os
 import pathlib
 import re
 import stat
+import sys
 import unicodedata
 import zipfile
 
@@ -102,10 +104,11 @@ def check_name(d, name):
         _flag(d, "hidden_file")
 
 
-def check_zip(d, path):
-    """A DOCX is a ZIP: look at its directory (sizes, names) without decompressing anything."""
+def check_zip(d, data):
+    """A DOCX is a ZIP: look at its directory (sizes, names) without decompressing anything.
+    It reads the same in-memory bytes that were hashed and that the parser worker will get."""
     try:
-        with zipfile.ZipFile(path) as z:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
             infos = z.infolist()
     except zipfile.BadZipFile:
         return _block(d, "type_mismatch:not_a_zip")
@@ -132,6 +135,19 @@ def check_zip(d, path):
     return d
 
 
+def opened_path(fd):
+    """The real path of an open file (Linux: /proc, macOS: F_GETPATH). None when the OS cannot say."""
+    try:
+        if sys.platform.startswith("linux"):
+            return os.readlink(f"/proc/self/fd/{fd}")
+        import fcntl
+        if hasattr(fcntl, "F_GETPATH"):
+            return fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).split(b"\0", 1)[0].decode()
+    except OSError:
+        pass
+    return None
+
+
 def decide(path, root):
     """Look at one file BEFORE it is parsed. `root` is the CV folder."""
     path, root = pathlib.Path(path), pathlib.Path(root).resolve()
@@ -141,26 +157,36 @@ def decide(path, root):
         st = os.lstat(path)
     except OSError as e:
         return _block(d, f"unreadable:{type(e).__name__}")
-    linked = stat.S_ISLNK(st.st_mode)
-    if linked:
-        target = path.resolve()
+    target = path
+    if stat.S_ISLNK(st.st_mode):
+        target = pathlib.Path(os.path.realpath(path))
         if root not in target.parents:
             return _block(d, "symlink_outside_cv_folder")
         _flag(d, "symlink")
-        st = os.stat(target)
-        path = target
-    if not stat.S_ISREG(st.st_mode):
+    elif not stat.S_ISREG(st.st_mode):
         return _block(d, "not_a_regular_file")             # a FIFO would hang the reader, a device never ends
-    d.size = st.st_size
-    if st.st_size > MAX_FILE_BYTES:
-        return _block(d, f"file_too_large:{st.st_size // 2**20}MB")
-    with os.fdopen(os.open(path, os.O_RDONLY | (0 if linked else getattr(os, "O_NOFOLLOW", 0))), "rb") as f:
+    # Open ONCE, then judge the open file itself (fstat, its real path), never the name again:
+    # O_NONBLOCK so a FIFO swapped in after lstat cannot hang us, O_NOFOLLOW so the last step is no link.
+    try:
+        fd = os.open(target, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as e:
+        return _block(d, f"unreadable:{type(e).__name__}")   # e.g. ELOOP: a link swapped in after the check
+    with os.fdopen(fd, "rb") as f:
+        fst = os.fstat(fd)
+        if not stat.S_ISREG(fst.st_mode):
+            return _block(d, "not_a_regular_file")
+        opened = opened_path(fd)
+        if opened is not None and root not in pathlib.Path(opened).parents:
+            return _block(d, "opened_file_outside_cv_folder")   # a folder on the way was swapped for a link
+        d.size = fst.st_size
+        if fst.st_size > MAX_FILE_BYTES:
+            return _block(d, f"file_too_large:{fst.st_size // 2**20}MB")
         data = f.read(MAX_FILE_BYTES + 1)
-    if len(data) > MAX_FILE_BYTES:                          # grew after lstat
+    if len(data) > MAX_FILE_BYTES:                          # grew while we read
         return _block(d, "file_too_large")
     d.sha256 = hashlib.sha256(data).hexdigest()
     d.snapshot = data
-    suffix = path.suffix.lower()
+    suffix = path.suffix.lower()                           # the type the CV folder entry claims, link or not
     if suffix == ".pdf":
         d.kind = "pdf"
         if MAGIC["pdf"] not in data[:1024]:
@@ -169,7 +195,7 @@ def decide(path, root):
         d.kind = "docx"
         if not data.startswith(MAGIC["zip"]):
             return _block(d, "type_mismatch:not_a_zip")
-        check_zip(d, path)
+        check_zip(d, data)
     else:
         d.kind = "text"
         if b"\x00" in data[:8192] or data.startswith(BINARY_MAGIC):
