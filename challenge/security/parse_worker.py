@@ -3,7 +3,10 @@ SECURITY · PHASE 2 · the parser worker: one CV file per process, never the ori
 
     stdin   the staged snapshot of the validated bytes (a read-only file the parent opened)
     argv    kind (pdf | docx | text), the SHA-256 the gate computed, json limits
-    stdout  {"ok": true, "text": ..., "pages": n}  or  {"ok": false, "reason": "<code>"}
+    stdout  {"ok": true, "text": ..., "pages": n, "hidden": {...}}  or  {"ok": false, "reason": "<code>"}
+
+Phase 3: for a PDF the worker also renders the pages and reports text a reader cannot see
+(pdf_inspect.py), so this inspection never runs in the app process.
 
 It verifies the snapshot's SHA-256, loads the extraction code (challenge/pipeline.py, without
 the embedding model), then locks itself down with an audit hook before touching the bytes:
@@ -67,6 +70,12 @@ def main():
     import pipeline
     import pypdf
     import docx  # noqa: F401  (loaded before the lock-down)
+    pdf_inspect = None
+    if kind == "pdf":
+        try:
+            from security import pdf_inspect           # pdfplumber + pypdfium2 (requirements-optional.txt)
+        except ImportError:
+            pass
     lock_down()
     try:
         pages = 0
@@ -77,6 +86,17 @@ def main():
         text = pipeline.read_bytes(kind, data)
         if len(text) > limits["max_chars"]:
             answer({"ok": False, "reason": f"text_too_long:{len(text)}"})
+        hidden = None
+        if kind == "pdf":
+            if pdf_inspect is None:
+                hidden = {"unavailable": "not_installed"}
+            else:
+                try:
+                    hidden = pdf_inspect.hidden_text(data)
+                except (MemoryError, PermissionError):
+                    raise
+                except Exception as e:                 # noqa: BLE001 · the text is fine, the check could not run
+                    hidden = {"unavailable": type(e).__name__}
     except MemoryError:
         answer({"ok": False, "reason": "memory_limit"})
     except RecursionError:
@@ -85,7 +105,7 @@ def main():
         answer({"ok": False, "reason": "sandbox_violation:" + str(e).split(": ", 1)[-1][:60]})
     except Exception as e:                             # noqa: BLE001 · a malformed file: report its error type only
         answer({"ok": False, "reason": f"parse_error:{type(e).__name__}"})
-    answer({"ok": True, "text": text, "pages": pages})
+    answer({"ok": True, "text": text, "pages": pages, "hidden": hidden})
 
 
 if __name__ == "__main__":

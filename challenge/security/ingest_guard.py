@@ -61,6 +61,14 @@ class Decision:
         return self.sha256[:16]
 
     @property
+    def verdict(self):
+        """Phase 3: the one word a person reads. accepted · flagged (indexed, please review) ·
+        quarantined (not indexed: blocked, unsafe, malicious, waiting for or rejected by a person)."""
+        if not self.ingest:
+            return "quarantined"
+        return "flagged" if self.flags else "accepted"
+
+    @property
     def ingest(self):
         """Should the pipeline read this file?"""
         if self.status in ("block", "quarantine") or self.review == "reject":
@@ -82,7 +90,8 @@ def _block(d, reason):
 
 
 def quarantine(d, reason):
-    """Phase 2: the file passed the gate but could not be parsed safely. No text is kept."""
+    """Phase 2: the file passed the gate but could not be parsed safely. Phase 3: or its text is
+    high-confidence malicious. No text is kept, and a person's "accept" does not override it."""
     d.status = "quarantine"
     d.reasons.append(reason)
     d.snapshot = b""
@@ -93,6 +102,9 @@ def _flag(d, reason):
     d.flags.append(reason)
     if d.status == "accept":
         d.status = "flag"
+
+
+flag = _flag                                           # Phase 3: content findings after parsing
 
 
 def check_name(d, name):
@@ -228,7 +240,7 @@ def apply_decisions(decisions, table):
 def write_report(decisions, path=None):
     """quarantine.json: every file that is blocked or flagged, with reason codes only (git-ignored)."""
     path = pathlib.Path(path or os.getenv("SECURITY_REPORT", HERE / "quarantine.json"))
-    rows = [{"source": d.source, "status": d.status, "reasons": d.reasons, "flags": d.flags, "sha256": d.sha256,
+    rows = [{"source": d.source, "verdict": d.verdict, "status": d.status, "reasons": d.reasons, "flags": d.flags, "sha256": d.sha256,
              "size": d.size, "review": d.review, "ingested": d.ingest} for d in decisions if d.status != "accept"]
     try:
         path.write_text(json.dumps({"mode": mode(), "files": rows}, indent=1, ensure_ascii=False), encoding="utf-8")

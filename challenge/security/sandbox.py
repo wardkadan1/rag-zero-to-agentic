@@ -1,7 +1,7 @@
 """
 SECURITY · PHASE 2 · parse every accepted CV in its own short-lived worker process.
 
-    parse_all([(key, kind, sha256, data), ...])  ->  {key: {"ok": True, "text": ..., "pages": n}
+    parse_all([(key, kind, sha256, data), ...])  ->  {key: {"ok": True, "text": ..., "pages": n, "hidden": ...}
                                                          | {"ok": False, "reason": "<code>"}}
 
 * No TOCTOU: the gate read the file ONCE and hashed those bytes (`data`). They are written to a
@@ -29,12 +29,13 @@ import time
 HERE = pathlib.Path(__file__).resolve().parent
 LAUNCHER, WORKER = HERE / "limits.py", HERE / "parse_worker.py"
 
-# Calibrated on the 26 real CV files (2026-10-27): peak 109 MB virtual / 90 MB resident,
-# 1.3 s CPU, 3 pages, 7,140 characters. Every limit leaves at least 4x headroom.
-LIMITS = {"cpu_s": 10, "as_mb": 512, "fsize_mb": 2, "nofile": 64}
+# Calibrated on the 26 real CV files (2026-10-27). Phase 2 (text only): peak 109 MB virtual /
+# 90 MB resident, 1.3 s CPU. Phase 3 (+ rendering each PDF page for hidden text): peak 288 MB
+# virtual / 195 MB resident, 3.5 s CPU; 3 pages, 7,140 characters. Every limit leaves >= 3x headroom.
+LIMITS = {"cpu_s": 15, "as_mb": 1024, "fsize_mb": 2, "nofile": 64}
 WORKER_LIMITS = {"max_pages": 30, "max_chars": 200_000}
-RSS_MB = 384               # the parent's watchdog: the memory cap that also works on macOS
-TIMEOUT_S = 20             # wall clock per file
+RSS_MB = 640               # the parent's watchdog: the memory cap that also works on macOS
+TIMEOUT_S = 30             # wall clock per file
 PARALLEL = max(1, min(4, os.cpu_count() or 1))
 SIGNALS = {getattr(signal, n): code for n, code in (("SIGXCPU", "cpu_limit"), ("SIGXFSZ", "output_too_large"),
                                                      ("SIGKILL", "worker_killed"), ("SIGSEGV", "worker_crashed:SIGSEGV"),
@@ -96,7 +97,8 @@ def result_of(proc, out_path, reason):
     except (OSError, ValueError):
         return {"ok": False, "reason": "worker_bad_output"}
     if answer.get("ok") is True and isinstance(answer.get("text"), str):
-        return {"ok": True, "text": answer["text"], "pages": int(answer.get("pages", 0))}
+        hidden = answer.get("hidden") if isinstance(answer.get("hidden"), dict) else None
+        return {"ok": True, "text": answer["text"], "pages": int(answer.get("pages", 0)), "hidden": hidden}
     if answer.get("ok") is False and isinstance(answer.get("reason"), str):
         return {"ok": False, "reason": answer["reason"][:120]}
     return {"ok": False, "reason": "worker_bad_output"}
@@ -107,7 +109,8 @@ def parse_all(jobs, worker=None, timeout=TIMEOUT_S, parallel=PARALLEL):
     stage = pathlib.Path(tempfile.mkdtemp(prefix="cv-parse-"))     # 0700, removed at the end
     home = stage / "cwd"
     home.mkdir(mode=0o500)
-    env = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "HOME": str(home), "TMPDIR": str(home)}
+    env = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "HOME": str(home), "TMPDIR": str(home),
+           "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}   # numpy: one thread
     queue, running, results = list(enumerate(jobs)), {}, {}
     try:
         while queue or running:

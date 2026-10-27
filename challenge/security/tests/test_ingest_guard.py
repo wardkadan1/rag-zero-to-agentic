@@ -92,7 +92,10 @@ def test_valid_files_of_every_type_are_accepted(tmp_path):
     decisions = {p.name: G.decide(p, d) for p in d.iterdir()}
     assert {n: x.status for n, x in decisions.items()} == dict.fromkeys(decisions, "accept")
     docs = pipeline.load_cvs(d)
-    assert len(docs) == 4 and all(r["status"] in ("ok", "short") and not r["flags"] for r in pipeline.INGEST_REPORT)
+    # Phase 3: three of these files hold the SAME text, so they are flagged as near-duplicates
+    # (for a person to look at); nothing else may be flagged, and all four are still indexed.
+    assert len(docs) == 4 and all(r["status"] in ("ok", "short") for r in pipeline.INGEST_REPORT)
+    assert all(f.startswith("content:near_duplicate:") for r in pipeline.INGEST_REPORT for f in r["flags"])
 
 
 def test_docx_with_customxml_and_other_ooxml_parts_is_not_blocked(tmp_path):

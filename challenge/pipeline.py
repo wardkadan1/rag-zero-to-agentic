@@ -167,10 +167,12 @@ def load_cvs(folder):
         d.snapshot = b""
         if not parsed.get(path.name, {"ok": True})["ok"]:
             ingest_guard.quarantine(d, "parse_failed:" + parsed[path.name]["reason"])
+    content_checks(checked, parsed)
     ingest_guard.write_report([d for _, d in checked])
     docs = []
     for path, decision in checked:
-        row = {"source": path.name, "status": "ok", "chars": 0, "detail": "", "flags": decision.flags}
+        row = {"source": path.name, "status": "ok", "chars": 0, "detail": "", "flags": decision.flags,
+               "verdict": decision.verdict}
         INGEST_REPORT.append(row)
         if decision.status == "block":
             row.update(status="blocked", detail="not opened: " + ", ".join(decision.reasons))
@@ -201,6 +203,31 @@ def load_cvs(folder):
     return docs
 
 
+def content_checks(checked, parsed):
+    """SECURITY · Phase 3 · what the parsed text says, before anything is indexed. A high finding
+    (instructions to an AI, invisible skill lists) quarantines the file: it never reaches Chroma,
+    BM25 or the graph. A medium finding is a flag for a person; the file is still indexed. The
+    checks read a normalized COPY of the text; the text that is indexed is not changed."""
+    from security import content, ingest_guard
+    texts = {}
+    for path, d in checked:
+        result = parsed.get(path.name)
+        if not d.ingest or not result or not result["ok"]:
+            continue
+        hidden = result.get("hidden") or {}
+        if "unavailable" in hidden:
+            ingest_guard.flag(d, "pdf_render_check_unavailable:" + str(hidden["unavailable"])[:40])
+        findings = (content.hidden_verdict(hidden, SKILL_RE) + content.scan_injection(result["text"])
+                    + content.scan_stuffing(result["text"], SKILL_RE, STOP))
+        for level, code in findings:
+            (ingest_guard.quarantine if level == "high" else ingest_guard.flag)(d, "content:" + code)
+        if d.ingest:
+            texts[path.name] = (d, result["text"])
+    for a, b, j in content.near_duplicates([{"source": s, "text": t} for s, (_, t) in texts.items()]):
+        ingest_guard.flag(texts[a][0], f"content:near_duplicate:{b}:{j}")   # never merged: one template,
+        ingest_guard.flag(texts[b][0], f"content:near_duplicate:{a}:{j}")   # two people is normal
+
+
 def print_ingest_report():
     counts = {}
     for row in INGEST_REPORT:
@@ -208,7 +235,8 @@ def print_ingest_report():
     print("Ingestion: " + ", ".join(f"{n} {status}" for status, n in counts.items()))
     for row in INGEST_REPORT:
         if row["status"] != "ok" or row.get("flags"):
-            print(f"  {row['status'].upper():9} {row['source']}: {row['detail']}")
+            label = row.get("verdict", "flagged") if row["status"] == "ok" else row["status"]
+            print(f"  {label.upper():11} {row['source']}: {row['detail']}")
 
 
 NOT_NAME = {"cv", "resume", "curriculum", "vitae", "general", "final", "new", "updated", "docx", "pdf", "doc", "my",
@@ -460,11 +488,18 @@ def rerank(query, pool, k):
     return sorted(pool, key=lambda h: -h["rerank"])[:k]
 
 
+DEMOTE = ("content:stuffing", "content:injection", "content:hidden_text")   # NOT near-duplicates: shared templates are normal
+
+
 def graph_hits(query, route):
     """STEP 7 · Every candidate the graph connects to the question, each with its best chunk."""
     want = question_filters(query) if FILTERS else {}
     pool = []
-    for source, name, entity in route[:GRAPH_MAX]:
+    # SECURITY · Phase 3: the cut at GRAPH_MAX comes AFTER ranking by evidence, so the file-name
+    # order of the route cannot decide who is left out, and a CV flagged for keyword stuffing
+    # cannot push out an unflagged one: flagged CVs go after the others before the cut.
+    flagged = {row["source"] for row in INGEST_REPORT if any(f.startswith(DEMOTE) for f in row.get("flags", ()))}
+    for source, name, entity in route:
         where = {"source": source}
         if "years" in want:                            # a minimum of years still applies
             where = {"$and": [where, {"years": {"$gte": want["years"]}}]}
@@ -472,6 +507,9 @@ def graph_hits(query, route):
         if best:
             pool.append(dict(best[0], via=f"graph: {entity} → {name}"))
     best = rerank(query, pool, len(pool)) if RERANK else pool
+    if len(best) > GRAPH_MAX and "rerank" not in best[0]:                   # no reranker: the vector score decides
+        best = sorted(best, key=lambda h: -h["score"])
+    best = sorted(best, key=lambda h: h["source"] in flagged)[:GRAPH_MAX]     # stable: keeps the ranking
     return [dict(h, rank=i + 1) for i, h in enumerate(best)]
 
 
