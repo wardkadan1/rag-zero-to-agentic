@@ -42,6 +42,7 @@ runpy.run_path({WORKER!r}, run_name="__main__")
 def isolated(tmp_path, monkeypatch):
     monkeypatch.setenv("SECURITY_REPORT", str(tmp_path / "quarantine.json"))
     monkeypatch.setenv("SECURITY_DECISIONS", str(tmp_path / "decisions.json"))
+    monkeypatch.setenv("SECURITY_IDENTITIES", str(tmp_path / "identities.json"))
     monkeypatch.delenv("SECURITY_MODE", raising=False)
 
 
@@ -126,7 +127,18 @@ def attacked_folder(tmp_path):
     return d
 
 
+def resolve_practice_versions(tmp_path, folder):
+    """A person's answer for the practice set: cand-009.md and cand-009-2023.md are two versions
+    of one candidate (Phase 4 would otherwise hold both back as an identity collision)."""
+    import hashlib
+    groups = {}
+    for p in sorted(folder.glob("cand-*.md"), key=lambda p: len(p.name)):
+        groups.setdefault(p.name[:8], []).append(hashlib.sha256(p.read_bytes()).hexdigest())
+    (tmp_path / "identities.json").write_text(json.dumps({"same_person": [g for g in groups.values() if len(g) > 1]}))
+
+
 def index_everything(tmp_path, monkeypatch, folder):
+    resolve_practice_versions(tmp_path, folder)
     monkeypatch.setattr(pipeline, "HERE", tmp_path)
     monkeypatch.setattr(pipeline, "embed", hashed_embed)
     docs = pipeline.load_cvs(folder)

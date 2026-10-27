@@ -17,6 +17,7 @@ Stuck or behind?  cp challenge/checkpoints/level3.py challenge/pipeline.py   (na
 import collections
 import pathlib
 import re
+import time
 
 import networkx as nx
 
@@ -168,6 +169,7 @@ def load_cvs(folder):
         if not parsed.get(path.name, {"ok": True})["ok"]:
             ingest_guard.quarantine(d, "parse_failed:" + parsed[path.name]["reason"])
     content_checks(checked, parsed)
+    identity = identity_checks(checked, parsed)       # SECURITY · Phase 4: trusted ids, never merged by name
     ingest_guard.write_report([d for _, d in checked])
     docs = []
     for path, decision in checked:
@@ -196,7 +198,8 @@ def load_cvs(folder):
             continue
         if len(text) < MIN_CHARS:
             row.update(status="short", detail=f"only {len(text)} characters: check this CV")
-        docs.append({"source": path.name, "text": text})
+        docs.append({"source": path.name, "text": text, **identity[path.name],
+                     "content_flagged": decision.review != "accept" and any(f.startswith(DEMOTE) for f in decision.flags)})
     print_ingest_report()
     if INGEST_REPORT and not docs:
         raise ValueError(f"none of the {len(INGEST_REPORT)} CV files gave text: see the console")
@@ -233,6 +236,25 @@ def content_checks(checked, parsed):
     for a, b, j in content.near_duplicates([{"source": s, "text": t} for s, (_, t) in texts.items()]):
         ingest_guard.flag(texts[a][0], f"content:near_duplicate:{b}:{j}")   # never merged: one template,
         ingest_guard.flag(texts[b][0], f"content:near_duplicate:{a}:{j}")   # two people is normal
+
+
+def identity_checks(checked, parsed):
+    """SECURITY · Phase 4 · each document gets a trusted document id (from its SHA-256) and a
+    candidate id that is NOT its name (security/provenance.py). Two documents that claim the
+    same name stay two candidates and are both flagged identity_collision, until a person
+    writes the answer in security/identities.json. Returns {source: {"doc_id", "candidate_id",
+    "current"}} for every file that is still to be indexed."""
+    from security import ingest_guard, provenance
+    docs = [{"source": path.name, "sha256": d.sha256, "doc_id": d.doc_id,
+             "name": candidate_name(path.name, normalize(parsed[path.name]["text"]))}
+            for path, d in checked if d.ingest and parsed.get(path.name, {}).get("ok")]
+    candidate, current, collisions = provenance.assign(docs)
+    flagged = {path.name: d for path, d in checked}
+    for a, b in collisions:
+        ingest_guard.flag(flagged[a], f"identity_collision:{b}")
+        ingest_guard.flag(flagged[b], f"identity_collision:{a}")
+    return {d["source"]: {"doc_id": d["doc_id"], "candidate_id": candidate[d["source"]], "current": current[d["source"]]}
+            for d in docs}
 
 
 def print_ingest_report():
@@ -350,22 +372,28 @@ def years_of_experience(text):
     return round(total / 12, 1)
 
 
+TRUSTED_KEYS = ("doc_id", "candidate_id", "current", "content_flagged")
+
+
 def chunk(doc):
     """Split ONE document into chunks.
     Return [{"id": "<unique id>", "source": doc["source"], "text": "<chunk text>"}, ...]
     You may add more keys (they become metadata), e.g. "name", "section", "city".
     Every chunk starts with whose CV it is, so a chunk from the middle of a CV still
-    matches a question that names the candidate."""
+    matches a question that names the candidate.
+    SECURITY · Phase 4: name, city and years are CLAIMS read from the CV's text (unverified).
+    doc_id, candidate_id, current and content_flagged come from ingestion (trusted)."""
     text, step = doc["text"], CHUNK_SIZE - CHUNK_OVERLAP
     name = candidate_name(doc["source"], text)
     facts = {"name": name, "city": find_city(text), "years": years_of_experience(text)}   # STEP 5 metadata
+    facts.update({k: doc[k] for k in TRUSTED_KEYS if k in doc})
     head = f"CV of {name}:\n" if name else ""
     chunks = []
     for start in range(0, max(len(text) - CHUNK_OVERLAP, 1), step):
         piece = text[start:start + CHUNK_SIZE]
         if piece.strip():
             chunks.append({"id": f"{doc['source']}#{len(chunks)}", "source": doc["source"], **facts,
-                           "text": head + piece})
+                           "offset": start, "text": head + piece})
     return chunks
 
 
@@ -374,24 +402,81 @@ def chunk(doc):
 #  delete and recreate a collection 'cvs' with cosine distance, add every chunk with its id,
 #  text, metadata and embed(texts) as embeddings. Return the collection count."
 COLLECTION = None
+ACTIVE_INFO = {"info": None}  # the index this process uses (chroma_db/ACTIVE.json)
+LAST_BUILD_FAILED = False
 
 
 def build_index(chunks):
-    """Store every chunk with its vector in a Chroma collection. Return how many are stored."""
+    """Store every chunk with its vector in a Chroma collection. Return how many are stored.
+    SECURITY · Phase 4: atomic. One writer at a time builds a NEW collection, checks it, and
+    only then makes it the active one (chroma_db/ACTIVE.json). If anything fails, the previous
+    index stays active, on disk and here (Chroma, BM25 and the graph), and the error says so."""
     import chromadb
-    global COLLECTION
-    client = chromadb.PersistentClient(path=str(HERE / "chroma_db"))
-    if "cvs" in [c.name for c in client.list_collections()]:
-        client.delete_collection("cvs")               # rebuild from scratch: no stale CVs left behind
-    COLLECTION = client.create_collection("cvs", metadata={"hnsw:space": "cosine"})
-    for start in range(0, len(chunks), 256):          # Chroma limits how much one add() takes
-        batch = chunks[start:start + 256]
-        COLLECTION.add(ids=[c["id"] for c in batch],
-                       documents=[c["text"] for c in batch],
-                       metadatas=[{k: v for k, v in c.items() if k not in ("id", "text")} for c in batch],
-                       embeddings=embed([c["text"] for c in batch]).tolist())
+    from security import index_store
+    global COLLECTION, LAST_BUILD_FAILED
+    folder = HERE / "chroma_db"
+    with index_store.writer_lock(folder):
+        client = chromadb.PersistentClient(path=str(folder))
+        old = index_store.read_active(folder) or {}
+        name = index_store.new_collection_name()
+        new = client.create_collection(name, metadata={"hnsw:space": "cosine"})
+        try:
+            for start in range(0, len(chunks), 256):      # Chroma limits how much one add() takes
+                batch = chunks[start:start + 256]
+                new.add(ids=[c["id"] for c in batch],
+                        documents=[c["text"] for c in batch],
+                        metadatas=[{k: v for k, v in c.items() if k not in ("id", "text")} | {"seq": start + i}
+                                   for i, c in enumerate(batch)],
+                        embeddings=embed([c["text"] for c in batch]).tolist())
+            problems = index_store.validate(new, chunks, embed)
+            if problems:
+                raise index_store.IndexBuildFailed("the new index failed its checks: " + ", ".join(problems))
+        except Exception as e:
+            LAST_BUILD_FAILED = True
+            client.delete_collection(name)            # only the half-built one; the active one is untouched
+            kept = f"; the previous index ({old.get('chunks', 0)} chunks) is still active" if old else ""
+            if isinstance(e, index_store.IndexBuildFailed):
+                raise index_store.IndexBuildFailed(str(e) + kept) from None
+            raise index_store.IndexBuildFailed(f"building the index failed ({type(e).__name__}){kept}") from e
+        info = {"collection": name, "previous": old.get("collection"), "chunks": len(chunks),
+                "documents": len({c.get("doc_id", c["source"]) for c in chunks}), "built_at": time.time()}
+        index_store.activate(folder, info)
+        for c in client.list_collections():          # keep the active and the previous one only
+            if c.name not in index_store.keep_names(info):
+                client.delete_collection(c.name)
+    COLLECTION, ACTIVE_INFO["info"], LAST_BUILD_FAILED = new, info, False
     build_bm25(chunks)
     return COLLECTION.count()
+
+
+def attach_index():
+    """SECURITY · Phase 4 · for READERS (the MCP server): use the active index the app built.
+    Never creates or deletes a collection and never reads the CV files. Raises IndexNotReady
+    when nothing has been built yet."""
+    import chromadb
+    from security import index_store
+    global COLLECTION
+    info = index_store.read_active(HERE / "chroma_db")
+    if not info:
+        raise index_store.IndexNotReady("no CV index yet: start the app (python challenge/app.py) to build it")
+    collection = chromadb.PersistentClient(path=str(HERE / "chroma_db")).get_collection(info["collection"])
+    got = collection.get(include=["documents", "metadatas"])
+    rows = sorted(zip(got["ids"], got["documents"], got["metadatas"]), key=lambda r: r[2].get("seq", 0))
+    chunks = [{"id": cid, **{k: v for k, v in meta.items() if k != "seq"}, "text": text} for cid, text, meta in rows]
+    COLLECTION, ACTIVE_INFO["info"] = collection, info
+    build_bm25(chunks)
+    build_graph(chunks)
+    return chunks
+
+
+def refresh_index():
+    """Re-attach when the writer has activated a newer index (a reader's index is never stale)."""
+    from security import index_store
+    info = index_store.read_active(HERE / "chroma_db")
+    if info and info.get("collection") != (ACTIVE_INFO.get("info") or {}).get("collection"):
+        attach_index()
+        return True
+    return False
 
 
 # ----------------------------------------------------------------- STEP 3 · BM25 keyword search
@@ -413,7 +498,9 @@ def build_bm25(chunks, k1=1.5, b=0.75):
     n = len(docs)
     BM25.update(chunks=chunks, tf=[collections.Counter(d) for d in docs], len=[len(d) for d in docs],
                 avg=sum(map(len, docs)) / max(n, 1), k1=k1, b=b,
-                idf={t: math.log((n - f + 0.5) / (f + 0.5) + 1) for t, f in df.items()})
+                idf={t: math.log((n - f + 0.5) / (f + 0.5) + 1) for t, f in df.items()},
+                # SECURITY · Phase 4: the words Level 5 knows come only from CVs nobody flagged
+                vocab={t for c, d in zip(chunks, docs) if not c.get("content_flagged") for t in d})
 
 
 def bm25_search(query, n, want=None):
@@ -505,7 +592,7 @@ def graph_hits(query, route):
     # SECURITY · Phase 3: the cut at GRAPH_MAX comes AFTER ranking by evidence, so the file-name
     # order of the route cannot decide who is left out, and a CV flagged for keyword stuffing
     # cannot push out an unflagged one: flagged CVs go after the others before the cut.
-    flagged = {row["source"] for row in INGEST_REPORT if any(f.startswith(DEMOTE) for f in row.get("flags", ()))}
+    flagged = {c["source"] for c in BM25["chunks"] if c.get("content_flagged")}   # set at ingestion (Phase 4: kept in the index)
     for source, name, entity in route:
         where = {"source": source}
         if "years" in want:                            # a minimum of years still applies
@@ -587,7 +674,7 @@ def strength(hits):
 def unknown_terms(question):
     """Named things the question asks about (a capitalised word or a known skill) that no CV
     contains at all: "Who knows Rust?" → ["Rust"] when no chunk has the word "rust"."""
-    vocab = BM25["idf"]
+    vocab = BM25.get("vocab", BM25["idf"])
     words = re.findall(r"[\w+#.-]+", question)[1:]           # the first word is capitalised anyway
     named = [w for w in words if (w[0].isupper() or w.lower() in SKILLS) and w.lower() not in QUESTION_WORDS]
     return [w for w in named if tokenize(w) and not all(t in vocab for t in tokenize(w))]
@@ -715,19 +802,38 @@ def extract(text):
 def build_graph(chunks):
     """STEP 7 · Graph RAG: return a networkx graph with (type, name) nodes, e.g.
     ("candidate", "Lina Haddad") —has_skill— ("skill", "kubernetes"). Give candidate nodes
-    source=<file name>. The 🕸 Graph tab draws it; use it in retrieve for "which candidates…" questions."""
+    source=<file name>. The 🕸 Graph tab draws it; use it in retrieve for "which candidates…" questions.
+    SECURITY · Phase 4: a candidate node is keyed by its trusted candidate id, never by the name
+    a CV claims ("Lina Haddad · 3fa2c1"), so two CVs with one name are two nodes. Every skill
+    and city edge says which document and chunk it was read from, and that it is unverified."""
     global GRAPH
+    if LAST_BUILD_FAILED and BM25["chunks"]:           # the new index was not activated: describe the active one
+        print("build_graph: the last build_index failed, so the graph is built from the index still in use")
+        chunks = BM25["chunks"]
     g, cvs = nx.Graph(), {}
-    for c in chunks:                                   # 7b · one CV = all its chunks
-        cvs.setdefault(c["source"], {"name": c.get("name") or c["source"], "text": []})["text"].append(c["text"])
-    for source, cv in cvs.items():
-        person = ("candidate", cv["name"])
-        g.add_node(person, source=source)
-        facts = extract("\n".join(cv["text"]))
-        for sk in facts["skills"]:
-            g.add_edge(person, ("skill", sk), relation="has_skill")
-        if facts["city"]:
-            g.add_edge(person, ("city", facts["city"]), relation="lives_in")
+    for c in chunks:                                   # 7b · one candidate = the chunks of their document(s)
+        cid = c.get("candidate_id") or c["source"]
+        cv = cvs.setdefault(cid, {"name": "", "source": c.get("current", c["source"]), "docs": {}})
+        if c["source"] == cv["source"] or not cv["name"]:
+            cv["name"] = c.get("name") or c["source"]
+        cv["docs"].setdefault((c["source"], c.get("doc_id", "")), []).append(c)
+    for cid, cv in cvs.items():
+        label = f"{cv['name']} · {cid[5:11]}" if cid.startswith("cand-") else cv["name"]
+        person = ("candidate", label)
+        g.add_node(person, source=cv["source"], name=cv["name"], candidate_id=cid,
+                   documents=sorted(src for src, _ in cv["docs"]))
+        for (source, doc_id), parts in cv["docs"].items():
+            facts = extract("\n".join(p["text"] for p in parts))
+            for kind, values, relation in (("skill", facts["skills"], "has_skill"),
+                                           ("city", [facts["city"]] if facts["city"] else [], "lives_in")):
+                for value in values:
+                    rx = SKILL_RE.get(value)
+                    where = next((p["id"] for p in parts if (rx.search(p["text"]) if rx else value in p["text"])), parts[0]["id"])
+                    claim = {"source": source, "doc_id": doc_id, "chunk": where, "verified": False}
+                    if g.has_edge(person, (kind, value)):
+                        g.edges[person, (kind, value)]["claims"].append(claim)
+                    else:
+                        g.add_edge(person, (kind, value), relation=relation, claims=[claim])
     GRAPH = g
     return g
 
@@ -748,4 +854,5 @@ def graph_route(query):
     if not named:
         return None
     people = set.intersection(*(set(GRAPH.neighbors(n)) for n in named))
-    return [(GRAPH.nodes[p]["source"], p[1], " + ".join(n[1] for n in named)) for p in sorted(people)]
+    return [(GRAPH.nodes[p]["source"], GRAPH.nodes[p].get("name", p[1]), " + ".join(n[1] for n in named))
+            for p in sorted(people)]

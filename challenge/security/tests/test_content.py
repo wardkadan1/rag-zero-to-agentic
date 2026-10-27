@@ -28,6 +28,7 @@ HIGH = "high"
 def isolated(tmp_path, monkeypatch):
     monkeypatch.setenv("SECURITY_REPORT", str(tmp_path / "quarantine.json"))
     monkeypatch.setenv("SECURITY_DECISIONS", str(tmp_path / "decisions.json"))
+    monkeypatch.setenv("SECURITY_IDENTITIES", str(tmp_path / "identities.json"))
     monkeypatch.delenv("SECURITY_MODE", raising=False)
 
 
@@ -263,7 +264,8 @@ def test_a_stuffed_cv_cannot_push_real_candidates_out_of_the_graph_answer(attack
 
 def test_when_everyone_is_clean_the_cut_follows_the_evidence_not_the_file_name(attacked_index, monkeypatch):
     monkeypatch.setattr(pipeline, "GRAPH_MAX", 3)
-    monkeypatch.setattr(pipeline, "INGEST_REPORT", [])                # no flags at all
+    for c in pipeline.BM25["chunks"]:                                # no flags at all
+        monkeypatch.setitem(c, "content_flagged", False)
     query = "Which candidates know Python?"
     route = pipeline.graph_route(query)
     monkeypatch.setattr(pipeline, "GRAPH_MAX", len(route))

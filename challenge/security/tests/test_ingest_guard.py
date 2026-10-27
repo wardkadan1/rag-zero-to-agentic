@@ -26,6 +26,7 @@ CV_TEXT = "Lina Haddad\nBackend engineer in Haifa. Python, Kafka and Docker sinc
 def isolated(tmp_path, monkeypatch):
     monkeypatch.setenv("SECURITY_REPORT", str(tmp_path / "quarantine.json"))
     monkeypatch.setenv("SECURITY_DECISIONS", str(tmp_path / "decisions.json"))
+    monkeypatch.setenv("SECURITY_IDENTITIES", str(tmp_path / "identities.json"))
     monkeypatch.delenv("SECURITY_MODE", raising=False)
 
 
@@ -95,7 +96,8 @@ def test_valid_files_of_every_type_are_accepted(tmp_path):
     # Phase 3: three of these files hold the SAME text, so they are flagged as near-duplicates
     # (for a person to look at); nothing else may be flagged, and all four are still indexed.
     assert len(docs) == 4 and all(r["status"] in ("ok", "short") for r in pipeline.INGEST_REPORT)
-    assert all(f.startswith("content:near_duplicate:") for r in pipeline.INGEST_REPORT for f in r["flags"])
+    # Phase 4: the same text also claims the same name in every file: an identity collision to review
+    assert all(f.startswith(("content:near_duplicate:", "identity_collision:")) for r in pipeline.INGEST_REPORT for f in r["flags"])
 
 
 def test_docx_with_customxml_and_other_ooxml_parts_is_not_blocked(tmp_path):
@@ -110,7 +112,12 @@ def test_docx_with_customxml_and_other_ooxml_parts_is_not_blocked(tmp_path):
 def test_practice_cvs_ingest_exactly_as_before(tmp_path):
     docs = pipeline.load_cvs(PRACTICE)
     assert len(docs) == len(list(PRACTICE.glob("*.md")))
-    assert all(r["status"] == "ok" and not r["flags"] for r in pipeline.INGEST_REPORT)
+    # Phase 4: two practice candidates have two CV versions each (cand-009 + cand-009-2023, cand-017
+    # + cand-017-2024): same claimed name, so they are flagged for a person, never merged. Still indexed.
+    assert all(r["status"] == "ok" for r in pipeline.INGEST_REPORT)
+    flagged = {r["source"] for r in pipeline.INGEST_REPORT if r["flags"]}
+    assert flagged == {"cand-009.md", "cand-009-2023.md", "cand-017.md", "cand-017-2024.md"}
+    assert all(f.startswith("identity_collision:") for r in pipeline.INGEST_REPORT for f in r["flags"])
 
 
 def test_exact_duplicates_are_still_skipped(tmp_path):

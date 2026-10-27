@@ -3,7 +3,9 @@ STEP 8 · Your CV chatbot as an MCP server (for Claude Code, Claude Desktop or K
 
 It imports challenge/pipeline.py, so it serves exactly the pipeline you built: ingestion,
 Chroma + BM25, rerank, filters, refusal and the graph. The assistant's own model writes the
-answer; this server only finds the CV evidence.
+answer; this server only finds the CV evidence. It READS the index the app built (the active
+collection in chroma_db/ACTIVE.json) and follows the app's rebuilds; it builds one only when
+there is none yet.
 
 Run it by hand to check it starts:   python challenge/mcp_server.py   (it waits for a client; Ctrl+C to stop)
 Connect it:                          .mcp.json has it as "cv-chatbot" (set CV_DIR there if your CVs are elsewhere)
@@ -24,11 +26,25 @@ from mcp.server.fastmcp import FastMCP
 
 with contextlib.redirect_stdout(sys.stderr):   # stdout is reserved for the MCP protocol
     import pipeline
+    from security import index_store
     CV_DIR = pathlib.Path(os.getenv("CV_DIR", HERE / "cvs"))
-    DOCS = pipeline.load_cvs(CV_DIR)
-    CHUNKS = [c for d in DOCS for c in pipeline.chunk(d)]
-    pipeline.build_index(CHUNKS)
-    pipeline.build_graph(CHUNKS)
+    try:                                       # SECURITY · Phase 4: a reader attaches to the app's index,
+        pipeline.attach_index()                # it never rebuilds or deletes it
+    except index_store.IndexNotReady:          # nothing built yet: build it once, as the (locked) writer
+        chunks = [c for d in pipeline.load_cvs(CV_DIR) for c in pipeline.chunk(d)]
+        pipeline.build_index(chunks)
+        pipeline.build_graph(chunks)
+
+
+def documents():
+    """{source: (first chunk, whole text)} rebuilt from the index (chunk offsets), not from the files."""
+    out = {}
+    for c in pipeline.BM25["chunks"]:
+        head = f"CV of {c['name']}:\n" if c.get("name") else ""
+        piece, at = c["text"][len(head):], c.get("offset", 0)
+        first, text = out.get(c["source"], (c, ""))
+        out[c["source"]] = (first, text[:at] + piece if at < len(text) else text + piece)
+    return out
 
 mcp = FastMCP("cv-chatbot")
 
@@ -48,10 +64,11 @@ def search_cvs(question: str) -> dict:
     returns every matching candidate. If 'refused' is true, no CV contains the answer: say so
     and do not guess. Judge candidates only on job-relevant facts."""
     with contextlib.redirect_stdout(sys.stderr):
+        pipeline.refresh_index()               # the app may have activated a newer index
         query = pipeline.make_query(question, [])
         hits = pipeline.retrieve(query, pipeline.K)
         refused = bool(pipeline.should_refuse(query, hits))
-    by_source = {c["source"]: c.get("name", "") for c in CHUNKS}
+    by_source = {c["source"]: c.get("name", "") for c in pipeline.BM25["chunks"]}
     return {
         "searched_for": query,
         "refused": refused,
@@ -63,15 +80,19 @@ def search_cvs(question: str) -> dict:
 @mcp.tool()
 def get_cv(file_name: str) -> dict:
     """Return one whole CV by its file name (the 'source' of a passage), with the facts the
-    pipeline extracted: candidate name, city, years of experience and skills."""
-    for d in DOCS:
-        if d["source"] == file_name:
-            first = pipeline.chunk(d)[0]
-            return {"source": file_name, "candidate": first.get("name", ""), "city": first.get("city", ""),
-                    "years_of_experience": first.get("years", 0), "skills": pipeline.extract(d["text"])["skills"],
-                    "text": private(d["text"])}
+    pipeline extracted: candidate name, city, years of experience and skills. These are the
+    CV's own claims, not verified facts; document_id and candidate_id are assigned by ingestion."""
+    with contextlib.redirect_stdout(sys.stderr):
+        pipeline.refresh_index()
+    docs = documents()
+    if file_name in docs:
+        first, text = docs[file_name]
+        return {"source": file_name, "document_id": first.get("doc_id", ""), "candidate_id": first.get("candidate_id", ""),
+                "claims_verified": False, "candidate": first.get("name", ""), "city": first.get("city", ""),
+                "years_of_experience": first.get("years", 0), "skills": pipeline.extract(text)["skills"],
+                "text": private(text)}
     return {"error": f"No CV named {file_name!r}. Use the 'source' of a search_cvs passage.",
-            "available": sorted(d["source"] for d in DOCS)}
+            "available": sorted(docs)}
 
 
 if __name__ == "__main__":
