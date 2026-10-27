@@ -159,7 +159,13 @@ def test_docx_bomb_is_blocked_before_parsing(tmp_path, monkeypatch):
     d = cvdir(tmp_path)
     make_docx_bomb(d / "Bomb_CV.docx")
     (d / "Real_CV.txt").write_text(CV_TEXT)
-    monkeypatch.setattr(pipeline, "read_docx", lambda p: pytest.fail("the parser opened a blocked file"))
+    from security import sandbox
+    real = sandbox.parse_all
+
+    def guarded(jobs, **kw):
+        assert all(j[0] != "Bomb_CV.docx" for j in jobs), "a blocked file reached the parser"
+        return real(jobs, **kw)
+    monkeypatch.setattr(sandbox, "parse_all", guarded)
     tracemalloc.start()
     docs = pipeline.load_cvs(d)
     peak = tracemalloc.get_traced_memory()[1]

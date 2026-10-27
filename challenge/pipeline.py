@@ -122,6 +122,17 @@ def read_file(path):
     return path.read_text(encoding="utf-8", errors="ignore")
 
 
+def read_bytes(kind, data):
+    """The plain text of one CV from its bytes. SECURITY · Phase 2: the parser worker gets the
+    snapshot the gate hashed, never the path. Same readers and same result as read_file."""
+    import io
+    if kind == "pdf":
+        return read_pdf(io.BytesIO(data))
+    if kind == "docx":
+        return read_docx(io.BytesIO(data))
+    return io.TextIOWrapper(io.BytesIO(data), encoding="utf-8", errors="ignore").read()
+
+
 SPACED = re.compile(r"(?<![^\W\d_])(?:[^\W\d_] ){2,}[^\W\d_](?![^\W\d_])")   # "P R O F I L E"
 SEPARATOR = re.compile(r"[-–—_=*~•·.─━═▪■□●○◆◇|]{4,}")                      # "————", "=====", "....."
 
@@ -142,19 +153,30 @@ def load_cvs(folder):
     `source` must be the FILE NAME: Verify checks retrieval against it.
     Exact duplicate files and files without text are left out, and every file gets a row in
     INGEST_REPORT (printed to the console), so nothing is skipped silently."""
-    from security import ingest_guard                 # SECURITY · Phase 1: every file is judged before a parser opens it
+    from security import ingest_guard, sandbox        # SECURITY · Phase 1: every file is judged before a parser opens it
     INGEST_REPORT.clear()
     checked = ingest_guard.gate(folder, CV_TYPES)
     digest = {path: d.sha256 for path, d in checked if d.ingest}
     keep = {}                                          # one file per content: the shortest name ("CV.pdf", not "CV 2.pdf")
     for path in sorted(digest, key=lambda p: (len(p.name), p.name)):
         keep.setdefault(digest[path], path.name)
+    # SECURITY · Phase 2: each kept file is parsed in its own limited worker, from the hashed snapshot
+    parsed = sandbox.parse_all([(path.name, d.kind, d.sha256, d.snapshot) for path, d in checked
+                                if d.ingest and keep[d.sha256] == path.name])
+    for path, d in checked:
+        d.snapshot = b""
+        if not parsed.get(path.name, {"ok": True})["ok"]:
+            ingest_guard.quarantine(d, "parse_failed:" + parsed[path.name]["reason"])
+    ingest_guard.write_report([d for _, d in checked])
     docs = []
     for path, decision in checked:
         row = {"source": path.name, "status": "ok", "chars": 0, "detail": "", "flags": decision.flags}
         INGEST_REPORT.append(row)
         if decision.status == "block":
             row.update(status="blocked", detail="not opened: " + ", ".join(decision.reasons))
+            continue
+        if decision.status == "quarantine":
+            row.update(status="quarantined", detail="no text kept: " + ", ".join(decision.reasons))
             continue
         if not decision.ingest:
             row.update(status="quarantined", detail="waiting for a person's decision: " + ", ".join(decision.flags)
@@ -165,11 +187,7 @@ def load_cvs(folder):
         if keep[digest[path]] != path.name:
             row.update(status="duplicate", detail=f"same bytes as {keep[digest[path]]}: not indexed twice")
             continue
-        try:
-            text = normalize(read_file(path))
-        except Exception as e:
-            row.update(status="failed", detail=f"{type(e).__name__}: {e}")
-            continue
+        text = normalize(parsed[path.name]["text"])
         row["chars"] = len(text)
         if not text:
             row.update(status="empty", detail="no text extracted (scanned image? unsupported layout?)")

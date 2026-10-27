@@ -45,13 +45,14 @@ HERE = pathlib.Path(__file__).resolve().parent
 @dataclasses.dataclass
 class Decision:
     source: str
-    status: str = "accept"         # accept | flag | block
+    status: str = "accept"         # accept | flag | block | quarantine (Phase 2: the parser failed)
     reasons: list = dataclasses.field(default_factory=list)   # why it is blocked
     flags: list = dataclasses.field(default_factory=list)     # heuristic findings (report-only)
     sha256: str = ""
     kind: str = ""                 # what the bytes are: pdf | docx | text
     size: int = 0
     review: str = ""               # a person's decision from decisions.json: accept | reject | ""
+    snapshot: bytes = dataclasses.field(default=b"", repr=False)   # the exact bytes that were hashed (Phase 2 parses these)
 
     @property
     def doc_id(self):
@@ -60,7 +61,7 @@ class Decision:
     @property
     def ingest(self):
         """Should the pipeline read this file?"""
-        if self.status == "block" or self.review == "reject":
+        if self.status in ("block", "quarantine") or self.review == "reject":
             return False
         if self.status == "flag" and mode() == "enforce":
             return self.review == "accept"
@@ -74,6 +75,15 @@ def mode():
 def _block(d, reason):
     d.status = "block"
     d.reasons.append(reason)
+    d.snapshot = b""
+    return d
+
+
+def quarantine(d, reason):
+    """Phase 2: the file passed the gate but could not be parsed safely. No text is kept."""
+    d.status = "quarantine"
+    d.reasons.append(reason)
+    d.snapshot = b""
     return d
 
 
@@ -149,6 +159,7 @@ def decide(path, root):
     if len(data) > MAX_FILE_BYTES:                          # grew after lstat
         return _block(d, "file_too_large")
     d.sha256 = hashlib.sha256(data).hexdigest()
+    d.snapshot = data
     suffix = path.suffix.lower()
     if suffix == ".pdf":
         d.kind = "pdf"
@@ -183,7 +194,7 @@ def load_decisions(path=None):
 def apply_decisions(decisions, table):
     for d in decisions:
         review = table.get(d.sha256, {}).get("decision", "") if d.sha256 else ""
-        if review in ("accept", "reject") and d.status != "block":   # a hard block is never overridden
+        if review in ("accept", "reject") and d.status not in ("block", "quarantine"):   # never overridden
             d.review = review
     return decisions
 
