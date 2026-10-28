@@ -79,8 +79,19 @@ class Decision:
         return True
 
 
+class SecurityConfigError(RuntimeError):
+    """The security settings are wrong or unsafe for this environment: nothing is ingested."""
+
+
 def mode():
-    return "enforce" if os.getenv("SECURITY_MODE", "report").lower() == "enforce" else "report"
+    """report (development) or enforce. Phase 5: an unknown value is an error (never a silent
+    fallback to report), and RAG_ENV=production refuses to run without SECURITY_MODE=enforce."""
+    raw = os.getenv("SECURITY_MODE", "").strip().lower()
+    if raw not in ("", "report", "enforce"):
+        raise SecurityConfigError(f"SECURITY_MODE={raw!r} is not 'report' or 'enforce'")
+    if os.getenv("RAG_ENV", "").strip().lower() in ("prod", "production") and raw != "enforce":
+        raise SecurityConfigError("RAG_ENV=production requires SECURITY_MODE=enforce")
+    return raw or "report"
 
 
 def _block(d, reason):

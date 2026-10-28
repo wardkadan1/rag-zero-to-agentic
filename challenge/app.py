@@ -124,6 +124,8 @@ def rag(question, history, generate=True):
         t["answer"] = pipeline.REFUSAL
     elif generate:
         t["answer"] = helpers.llm(pipeline.SYSTEM_PROMPT, t["prompt"], 300)
+        if hasattr(pipeline, "safe_answer"):        # SECURITY · Phase 5: no HTML, images or links reach the browser
+            t["answer"] = pipeline.safe_answer(t["answer"])
     else:
         t["answer"] = "(answers off: retrieval only)"
     t["answer_ms"] = (time.perf_counter() - t1) * 1000
