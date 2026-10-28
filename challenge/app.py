@@ -193,7 +193,12 @@ def run_verify(file, generate, progress=gr.Progress()):
                f"| Avg. search / answer time | {np.mean([x['search_ms'] for x in tr]):.0f} ms / {np.mean([x['answer_ms'] for x in tr]):.0f} ms |\n"
                f"| Avg. prompt size | {np.mean([x['prompt_tokens'] for x in tr]):.0f} tokens |")
     out = HERE / "verify_results.json"
-    out.write_text(json.dumps({"K": pipeline.K, "results": list(traces.values())}, indent=1, ensure_ascii=False, default=str))
+    export = {"K": pipeline.K, "results": list(traces.values())}
+    if hasattr(pipeline, "redact_export"):          # SECURITY: no contact details in the export, owner-only file
+        export = pipeline.redact_export(export)
+    out.touch(mode=0o600)
+    out.chmod(0o600)                                # owner-only before anything is written
+    out.write_text(json.dumps(export, indent=1, ensure_ascii=False, default=str))
     return summary, rows, gr.update(choices=list(traces), value=rows[0][1] if rows else None), str(out), traces
 
 

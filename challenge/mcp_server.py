@@ -13,8 +13,9 @@ Connect it:                          .mcp.json has it as "cv-chatbot" (start the
 Privacy and safety (SECURITY · Phase 5): the CVs are real people's data.
 * Every tool is read-only and serves only CVs in the active index.
 * One PII policy (security/pii.py) masks e-mail addresses, phone numbers and links in
-  everything returned. Contact details are only available from get_contact_details, with
-  the operator's explicit authorization (CV_CONTACT_ACCESS=granted) and a stated purpose.
+  everything returned. The get_contact_details tool does not exist for agents unless the
+  operator sets CV_MCP_CONTACT_TOOL=enabled (development only), and then it still needs
+  CV_CONTACT_ACCESS=granted and a stated purpose. Never in production.
 * CV text is untrusted: no HTML, images or links pass through, passages that talk to an AI
   are withheld, and every result says where it comes from and that its claims are unverified.
 * With RAG_ENV=production the server refuses to start unless SECURITY_MODE=enforce.
@@ -138,7 +139,6 @@ def get_cv(file_name: str) -> dict:
             "text": "(withheld: this CV contains instructions aimed at an AI)" if risk else clean(text)}
 
 
-@mcp.tool()
 def get_contact_details(file_name: str, purpose: str) -> dict:
     """Contact details (e-mail, phone, links) of one CV. Needs the operator's explicit
     authorization for this server (CV_CONTACT_ACCESS=granted) and a stated purpose; every
@@ -152,6 +152,14 @@ def get_contact_details(file_name: str, purpose: str) -> dict:
     except access.NotAuthorized as e:
         return {"error": "not_authorized", "detail": str(e)}
     return {"source": file_name, "contacts": details, "notice": "Use only for the stated purpose."}
+
+
+# Final review: the contact tool is OFF for every agent unless the operator turns it on for this
+# server (development only; never in production). An agent cannot see or call a tool that is off.
+CONTACT_TOOL = (pipeline.os.getenv("CV_MCP_CONTACT_TOOL", "").strip().lower() == "enabled"
+                and pipeline.os.getenv("RAG_ENV", "").strip().lower() not in ("prod", "production"))
+if CONTACT_TOOL:
+    mcp.tool()(get_contact_details)
 
 
 if __name__ == "__main__":

@@ -189,7 +189,7 @@ def test_mcp_tools_are_read_only_and_serve_only_indexed_cvs(server, tmp_path):
              (folder / "ACTIVE.json").read_text())
     assert before == after
     tools = sorted(t.name for t in server.mcp._tool_manager.list_tools())
-    assert tools == ["get_contact_details", "get_cv", "search_cvs"]
+    assert tools == ["get_cv", "search_cvs"]              # the contact tool is off for agents by default
 
 
 # ------------------------------------------------------------------ production configuration
