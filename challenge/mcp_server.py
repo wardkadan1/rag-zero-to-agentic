@@ -3,18 +3,17 @@ STEP 8 · Your CV chatbot as an MCP server (for Claude Code, Claude Desktop or K
 
 It imports challenge/pipeline.py, so it serves exactly the pipeline you built: ingestion,
 Chroma + BM25, rerank, filters, refusal and the graph. The assistant's own model writes the
-answer; this server only finds the CV evidence. It READS the index the app built (the active
-collection in chroma_db/ACTIVE.json) and follows the app's rebuilds; it builds one only when
-there is none yet.
+answer; this server only finds the CV evidence. It only READS the index the app built (the
+active collection in chroma_db/ACTIVE.json) and follows the app's rebuilds. With no index it
+answers every call with an initialization error; it never opens the CV files itself.
 
 Run it by hand to check it starts:   python challenge/mcp_server.py   (it waits for a client; Ctrl+C to stop)
-Connect it:                          .mcp.json has it as "cv-chatbot" (set CV_DIR there if your CVs are elsewhere)
+Connect it:                          .mcp.json has it as "cv-chatbot" (start the app once first: it builds the index)
 
 Privacy: the CVs are real people's data. Phone numbers and e-mail addresses are masked in
 everything this server returns, so they never reach the assistant's answers.
 """
 import contextlib
-import os
 import pathlib
 import re
 import sys
@@ -27,13 +26,26 @@ from mcp.server.fastmcp import FastMCP
 with contextlib.redirect_stdout(sys.stderr):   # stdout is reserved for the MCP protocol
     import pipeline
     from security import index_store
-    CV_DIR = pathlib.Path(os.getenv("CV_DIR", HERE / "cvs"))
-    try:                                       # SECURITY · Phase 4: a reader attaches to the app's index,
-        pipeline.attach_index()                # it never rebuilds or deletes it
-    except index_store.IndexNotReady:          # nothing built yet: build it once, as the (locked) writer
-        chunks = [c for d in pipeline.load_cvs(CV_DIR) for c in pipeline.chunk(d)]
-        pipeline.build_index(chunks)
-        pipeline.build_graph(chunks)
+    NOT_READY = None
+    try:                                       # SECURITY · Phase 4: strictly a READER of the app's index:
+        pipeline.attach_index()                # it never reads CV files, ingests, builds, activates or deletes
+    except index_store.IndexNotReady as e:
+        NOT_READY = str(e)
+
+
+def not_ready():
+    """The initialization error while there is no index; None once the app has built one."""
+    global NOT_READY
+    if NOT_READY:
+        try:
+            with contextlib.redirect_stdout(sys.stderr):
+                pipeline.attach_index()
+            NOT_READY = None
+        except index_store.IndexNotReady as e:
+            NOT_READY = str(e)
+    return {"error": "index_not_initialized", "detail": NOT_READY,
+            "action": "An operator must build the index with the app: python challenge/app.py, then Reload pipeline."} \
+        if NOT_READY else None
 
 
 def documents():
@@ -63,6 +75,8 @@ def search_cvs(question: str) -> dict:
     file and candidate name. Ask one focused question per call; "which candidates know X?"
     returns every matching candidate. If 'refused' is true, no CV contains the answer: say so
     and do not guess. Judge candidates only on job-relevant facts."""
+    if not_ready():
+        return not_ready()
     with contextlib.redirect_stdout(sys.stderr):
         pipeline.refresh_index()               # the app may have activated a newer index
         query = pipeline.make_query(question, [])
@@ -82,6 +96,8 @@ def get_cv(file_name: str) -> dict:
     """Return one whole CV by its file name (the 'source' of a passage), with the facts the
     pipeline extracted: candidate name, city, years of experience and skills. These are the
     CV's own claims, not verified facts; document_id and candidate_id are assigned by ingestion."""
+    if not_ready():
+        return not_ready()
     with contextlib.redirect_stdout(sys.stderr):
         pipeline.refresh_index()
     docs = documents()

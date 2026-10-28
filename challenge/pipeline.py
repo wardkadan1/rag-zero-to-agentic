@@ -17,6 +17,7 @@ Stuck or behind?  cp challenge/checkpoints/level3.py challenge/pipeline.py   (na
 import collections
 import pathlib
 import re
+import threading
 import time
 
 import networkx as nx
@@ -404,23 +405,42 @@ def chunk(doc):
 COLLECTION = None
 ACTIVE_INFO = {"info": None}  # the index this process uses (chroma_db/ACTIVE.json)
 LAST_BUILD_FAILED = False
+RAG_LOCK = threading.RLock()  # SECURITY · Phase 4 fix: Chroma, BM25 and the graph change together, never one by one
+
+
+def install(collection, bm25, graph, info):
+    """Make one prepared, validated index version the one this process uses: all three at once."""
+    global COLLECTION, BM25, GRAPH
+    from security import index_store
+    with RAG_LOCK:
+        COLLECTION, BM25, GRAPH = collection, bm25, graph
+        ACTIVE_INFO["info"] = info
+    index_store.lease(HERE / "chroma_db", info["collection"])   # keep it while this process uses it
+
+
+def index_version():
+    """Which index version each part of the RAG state belongs to (all equal, or something is wrong)."""
+    with RAG_LOCK:
+        return {"active": (ACTIVE_INFO["info"] or {}).get("collection"), "chroma": getattr(COLLECTION, "name", None),
+                "bm25": BM25.get("version"), "graph": GRAPH.graph.get("version")}
 
 
 def build_index(chunks):
     """Store every chunk with its vector in a Chroma collection. Return how many are stored.
-    SECURITY · Phase 4: atomic. One writer at a time builds a NEW collection, checks it, and
-    only then makes it the active one (chroma_db/ACTIVE.json). If anything fails, the previous
-    index stays active, on disk and here (Chroma, BM25 and the graph), and the error says so."""
+    SECURITY · Phase 4: atomic. One writer at a time builds a NEW collection beside the active
+    one, checks it, prepares BM25, the graph and the Level 5 vocabulary from the same chunks,
+    and only then activates it (chroma_db/ACTIVE.json) and switches all of them together. If any
+    step fails, the previous index stays active, on disk and here, and the error says so."""
     import chromadb
     from security import index_store
-    global COLLECTION, LAST_BUILD_FAILED
+    global LAST_BUILD_FAILED
     folder = HERE / "chroma_db"
     with index_store.writer_lock(folder):
         client = chromadb.PersistentClient(path=str(folder))
         old = index_store.read_active(folder) or {}
         name = index_store.new_collection_name()
-        new = client.create_collection(name, metadata={"hnsw:space": "cosine"})
         try:
+            new = index_store.create(client, name)
             for start in range(0, len(chunks), 256):      # Chroma limits how much one add() takes
                 batch = chunks[start:start + 256]
                 new.add(ids=[c["id"] for c in batch],
@@ -431,41 +451,51 @@ def build_index(chunks):
             problems = index_store.validate(new, chunks, embed)
             if problems:
                 raise index_store.IndexBuildFailed("the new index failed its checks: " + ", ".join(problems))
+            bm25, graph = make_bm25(chunks, version=name), make_graph(chunks, version=name)
+            info = {"collection": name, "previous": old.get("collection"), "chunks": len(chunks),
+                    "documents": len({c.get("doc_id", c["source"]) for c in chunks}), "built_at": time.time()}
+            index_store.activate(folder, info)
         except Exception as e:
             LAST_BUILD_FAILED = True
-            client.delete_collection(name)            # only the half-built one; the active one is untouched
+            try:
+                if name in {c.name for c in client.list_collections()}:
+                    index_store.drop(client, name)    # only the half-built one; the active one is untouched
+            except Exception as cleanup:                # noqa: BLE001 · left for the next build's prune
+                print(f"build_index: could not remove the unfinished collection ({type(cleanup).__name__})")
             kept = f"; the previous index ({old.get('chunks', 0)} chunks) is still active" if old else ""
             if isinstance(e, index_store.IndexBuildFailed):
                 raise index_store.IndexBuildFailed(str(e) + kept) from None
             raise index_store.IndexBuildFailed(f"building the index failed ({type(e).__name__}){kept}") from e
-        info = {"collection": name, "previous": old.get("collection"), "chunks": len(chunks),
-                "documents": len({c.get("doc_id", c["source"]) for c in chunks}), "built_at": time.time()}
-        index_store.activate(folder, info)
-        for c in client.list_collections():          # keep the active and the previous one only
-            if c.name not in index_store.keep_names(info):
-                client.delete_collection(c.name)
-    COLLECTION, ACTIVE_INFO["info"], LAST_BUILD_FAILED = new, info, False
-    build_bm25(chunks)
+        install(new, bm25, graph, info)
+        LAST_BUILD_FAILED = False
+        try:
+            index_store.prune(client, folder, info)    # old versions no reader needs any more
+        except Exception as e:                          # noqa: BLE001 · the new index is fine; retried next build
+            print(f"build_index: could not remove old collections ({type(e).__name__}); will retry next build")
     return COLLECTION.count()
+
+
+def read_active_chunks(collection):
+    got = collection.get(include=["documents", "metadatas"])
+    rows = sorted(zip(got["ids"], got["documents"], got["metadatas"]), key=lambda r: r[2].get("seq", 0))
+    return [{"id": cid, **{k: v for k, v in meta.items() if k != "seq"}, "text": text} for cid, text, meta in rows]
 
 
 def attach_index():
     """SECURITY · Phase 4 · for READERS (the MCP server): use the active index the app built.
     Never creates or deletes a collection and never reads the CV files. Raises IndexNotReady
-    when nothing has been built yet."""
+    when nothing has been built yet. The new state is prepared first and switched in one step."""
     import chromadb
     from security import index_store
-    global COLLECTION
     info = index_store.read_active(HERE / "chroma_db")
     if not info:
-        raise index_store.IndexNotReady("no CV index yet: start the app (python challenge/app.py) to build it")
+        raise index_store.IndexNotReady("no CV index yet: build it with the app (python challenge/app.py, "
+                                        "Reload pipeline); the MCP server only reads an existing index")
     collection = chromadb.PersistentClient(path=str(HERE / "chroma_db")).get_collection(info["collection"])
-    got = collection.get(include=["documents", "metadatas"])
-    rows = sorted(zip(got["ids"], got["documents"], got["metadatas"]), key=lambda r: r[2].get("seq", 0))
-    chunks = [{"id": cid, **{k: v for k, v in meta.items() if k != "seq"}, "text": text} for cid, text, meta in rows]
-    COLLECTION, ACTIVE_INFO["info"] = collection, info
-    build_bm25(chunks)
-    build_graph(chunks)
+    chunks = read_active_chunks(collection)
+    if len(chunks) != info.get("chunks", len(chunks)):
+        raise index_store.IndexNotReady("the active index is incomplete: rebuild it with the app")
+    install(collection, make_bm25(chunks, version=info["collection"]), make_graph(chunks, version=info["collection"]), info)
     return chunks
 
 
@@ -491,16 +521,21 @@ def tokenize(text):
     return [t for t in re.findall(r"[a-z0-9]+(?:[+#]+|(?:[.][a-z0-9]+)+)?", text.lower()) if t not in STOP]
 
 
-def build_bm25(chunks, k1=1.5, b=0.75):
+def make_bm25(chunks, k1=1.5, b=0.75, version=None):
     import collections, math
     docs = [tokenize(c["text"]) for c in chunks]
     df = collections.Counter(t for d in docs for t in set(d))
     n = len(docs)
-    BM25.update(chunks=chunks, tf=[collections.Counter(d) for d in docs], len=[len(d) for d in docs],
-                avg=sum(map(len, docs)) / max(n, 1), k1=k1, b=b,
+    return dict(chunks=chunks, tf=[collections.Counter(d) for d in docs], len=[len(d) for d in docs],
+                avg=sum(map(len, docs)) / max(n, 1), k1=k1, b=b, version=version,
                 idf={t: math.log((n - f + 0.5) / (f + 0.5) + 1) for t, f in df.items()},
                 # SECURITY · Phase 4: the words Level 5 knows come only from CVs nobody flagged
                 vocab={t for c, d in zip(chunks, docs) if not c.get("content_flagged") for t in d})
+
+
+def build_bm25(chunks, k1=1.5, b=0.75):
+    global BM25
+    BM25 = make_bm25(chunks, k1, b)
 
 
 def bm25_search(query, n, want=None):
@@ -682,6 +717,11 @@ def unknown_terms(question):
 
 def retrieve(query, k=K):
     """Return the k best chunks: [{"rank": 1, "source": ..., "text": ..., "score": ..., "via": "vector"}, ...]"""
+    with RAG_LOCK:                                     # one index version for the whole question
+        return agent_retrieve(query, k)
+
+
+def agent_retrieve(query, k=K):
     AGENT_TRACE.clear()
     if not AGENT:
         route = graph_route(query)
@@ -807,10 +847,17 @@ def build_graph(chunks):
     a CV claims ("Lina Haddad · 3fa2c1"), so two CVs with one name are two nodes. Every skill
     and city edge says which document and chunk it was read from, and that it is unverified."""
     global GRAPH
-    if LAST_BUILD_FAILED and BM25["chunks"]:           # the new index was not activated: describe the active one
-        print("build_graph: the last build_index failed, so the graph is built from the index still in use")
-        chunks = BM25["chunks"]
-    g, cvs = nx.Graph(), {}
+    if ACTIVE_INFO["info"] and GRAPH.graph.get("version") == ACTIVE_INFO["info"]["collection"]:
+        if LAST_BUILD_FAILED or [c["id"] for c in chunks] == [c["id"] for c in BM25["chunks"]]:
+            if LAST_BUILD_FAILED:                      # the new index was not activated: keep the active one's
+                print("build_graph: the last build_index failed, so the graph of the index still in use is kept")
+            return GRAPH                               # build_index prepared it with the same chunks
+    GRAPH = make_graph(chunks)
+    return GRAPH
+
+
+def make_graph(chunks, version=None):
+    g, cvs = nx.Graph(version=version), {}
     for c in chunks:                                   # 7b · one candidate = the chunks of their document(s)
         cid = c.get("candidate_id") or c["source"]
         cv = cvs.setdefault(cid, {"name": "", "source": c.get("current", c["source"]), "docs": {}})
@@ -834,7 +881,6 @@ def build_graph(chunks):
                         g.edges[person, (kind, value)]["claims"].append(claim)
                     else:
                         g.add_edge(person, (kind, value), relation=relation, claims=[claim])
-    GRAPH = g
     return g
 
 

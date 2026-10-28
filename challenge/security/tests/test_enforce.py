@@ -179,11 +179,9 @@ def test_enforce_accept_releases_a_flagged_cv_but_never_a_quarantined_one(tmp_pa
 
 def test_enforce_keeps_flagged_cvs_out_of_the_mcp_tools(tmp_path, monkeypatch):
     monkeypatch.setenv("SECURITY_MODE", "enforce")
-    monkeypatch.setenv("CV_DIR", str(attacked_folder(tmp_path)))
-    monkeypatch.setattr(pipeline, "HERE", tmp_path)
-    monkeypatch.setattr(pipeline, "embed", hashed_embed)
+    index_everything(tmp_path, monkeypatch, attacked_folder(tmp_path))   # the app builds the index
     monkeypatch.delitem(sys.modules, "mcp_server", raising=False)
-    server = importlib.import_module("mcp_server")                    # builds its index from CV_DIR on import
+    server = importlib.import_module("mcp_server")                    # the MCP server only attaches to it
     try:
         found = server.search_cvs("Which candidates know Python?")
         assert found["passages"] and not {p["source"] for p in found["passages"]} & {"Aaron_Abbot_CV.md",

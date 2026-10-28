@@ -7,10 +7,12 @@ SECURITY · PHASE 4 · atomic index builds: build aside, validate, then switch.
     activate(folder, info)                   ACTIVE.json replaced atomically (write, fsync, rename)
     read_active(folder)                      what readers attach to; they never create or delete
     keep_names(info)                         the active and the previous collection (prune the rest)
+    lease(folder, name) / release(folder)    a reader says which collection it is using
+    prune(client, folder, info)              delete the rest, never one a live reader still uses
 
 A failed build never touches ACTIVE.json, so the previous working index stays the one in use.
-The previous collection is kept one more build, so a reader attached to it keeps working
-until it re-attaches.
+The previous collection is kept one more build, and any collection a live reader process has
+leased is kept until that reader moves on, so a reader never loses its index mid-question.
 """
 import contextlib
 import json
@@ -22,6 +24,8 @@ import time
 ACTIVE = "ACTIVE.json"
 LOCK = ".writer.lock"
 PREFIX = "cvs_"
+READERS = "readers"
+LEASE_S = 3600             # a lease older than this (reader hung or killed) no longer protects
 
 
 class IndexBusy(RuntimeError):
@@ -105,3 +109,64 @@ def validate(collection, chunks, embed):
         if probe["id"] not in res["ids"][0]:
             problems.append("probe_not_found")
     return problems
+
+
+def create(client, name):
+    return client.create_collection(name, metadata={"hnsw:space": "cosine"})
+
+
+def drop(client, name):
+    client.delete_collection(name)
+
+
+def lease(folder, name):
+    """Record that THIS process reads collection `name` (renewed on every attach)."""
+    readers = pathlib.Path(folder) / READERS
+    readers.mkdir(parents=True, exist_ok=True)
+    path = readers / f"{os.getpid()}.json"
+    tmp = readers / f".{os.getpid()}.{secrets.token_hex(3)}.tmp"
+    tmp.write_text(json.dumps({"collection": name, "pid": os.getpid(), "t": time.time()}))
+    os.replace(tmp, path)
+
+
+def release(folder):
+    try:
+        (pathlib.Path(folder) / READERS / f"{os.getpid()}.json").unlink()
+    except OSError:
+        pass
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:                            # exists, owned by someone else
+        return True
+
+
+def leased(folder):
+    """Collections that live reader processes still use. Dead or expired leases are removed."""
+    out = set()
+    for path in (pathlib.Path(folder) / READERS).glob("*.json"):
+        try:
+            entry = json.loads(path.read_text())
+            if _alive(int(entry["pid"])) and time.time() - float(entry["t"]) < LEASE_S:
+                out.add(entry["collection"])
+                continue
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    return out
+
+
+def prune(client, folder, info):
+    """Delete every collection that is not active, previous, or leased by a live reader."""
+    keep = keep_names(info) | leased(folder)
+    for c in client.list_collections():
+        if c.name not in keep:
+            drop(client, c.name)
