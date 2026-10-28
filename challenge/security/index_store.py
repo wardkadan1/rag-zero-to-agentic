@@ -15,17 +15,29 @@ The previous collection is kept one more build, and any collection a live reader
 leased is kept until that reader moves on, so a reader never loses its index mid-question.
 """
 import contextlib
+import hashlib
+import hmac
 import json
 import os
 import pathlib
 import secrets
+import threading
 import time
+
+from . import POLICY_VERSION
 
 ACTIVE = "ACTIVE.json"
 LOCK = ".writer.lock"
 PREFIX = "cvs_"
 READERS = "readers"
 LEASE_S = 3600             # a lease older than this (reader hung or killed) no longer protects
+HEARTBEAT_S = 300          # a live reader renews its lease this often, so an active reader never expires
+KEY = ".index_key"         # HMAC key for ACTIVE.json (0600): detects edited or foreign manifests
+TRUSTED = ("accepted", "reviewed")
+
+
+def now():
+    return time.time()                                 # one clock, so tests can move it
 
 
 class IndexBusy(RuntimeError):
@@ -38,6 +50,10 @@ class IndexBuildFailed(RuntimeError):
 
 class IndexNotReady(RuntimeError):
     """There is no active index to attach to yet."""
+
+
+class IndexRejected(IndexNotReady):
+    """There is an active index, but this process must not serve it (wrong mode, policy, provenance)."""
 
 
 @contextlib.contextmanager
@@ -125,8 +141,35 @@ def lease(folder, name):
     readers.mkdir(parents=True, exist_ok=True)
     path = readers / f"{os.getpid()}.json"
     tmp = readers / f".{os.getpid()}.{secrets.token_hex(3)}.tmp"
-    tmp.write_text(json.dumps({"collection": name, "pid": os.getpid(), "t": time.time()}))
+    tmp.write_text(json.dumps({"collection": name, "pid": os.getpid(), "t": now()}))
     os.replace(tmp, path)
+    HELD.update(folder=str(folder), name=name)
+    _start_heartbeat()
+
+
+HELD = {"folder": None, "name": None}                  # this process's lease
+_BEAT = {"thread": None, "stop": threading.Event()}
+
+
+def renew():
+    """Refresh this process's lease (the heartbeat, and every refresh_index, call this)."""
+    if HELD["folder"] and HELD["name"]:
+        try:
+            lease(HELD["folder"], HELD["name"])
+        except OSError:
+            pass
+
+
+def _start_heartbeat():
+    if _BEAT["thread"] and _BEAT["thread"].is_alive():
+        return
+    _BEAT["stop"].clear()
+
+    def beat():
+        while not _BEAT["stop"].wait(HEARTBEAT_S):
+            renew()
+    _BEAT["thread"] = threading.Thread(target=beat, name="index-lease-heartbeat", daemon=True)
+    _BEAT["thread"].start()
 
 
 def release(folder):
@@ -134,6 +177,9 @@ def release(folder):
         (pathlib.Path(folder) / READERS / f"{os.getpid()}.json").unlink()
     except OSError:
         pass
+    if HELD["folder"] == str(folder):
+        HELD.update(folder=None, name=None)
+        _BEAT["stop"].set()
 
 
 def _alive(pid):
@@ -152,7 +198,7 @@ def leased(folder):
     for path in (pathlib.Path(folder) / READERS).glob("*.json"):
         try:
             entry = json.loads(path.read_text())
-            if _alive(int(entry["pid"])) and time.time() - float(entry["t"]) < LEASE_S:
+            if _alive(int(entry["pid"])) and now() - float(entry["t"]) < LEASE_S:
                 out.add(entry["collection"])
                 continue
         except (OSError, ValueError, KeyError, TypeError):
@@ -170,3 +216,55 @@ def prune(client, folder, info):
     for c in client.list_collections():
         if c.name not in keep:
             drop(client, c.name)
+
+
+# ----------------------------------------------------------------- index provenance (final review)
+def fingerprint(chunks):
+    """One hash over what a question can see: chunk ids, texts, document ids and trust, in order."""
+    h = hashlib.sha256()
+    for c in chunks:
+        h.update(json.dumps([c["id"], hashlib.sha256(c["text"].encode()).hexdigest(), c.get("doc_id"), c.get("trust")]).encode())
+    return h.hexdigest()
+
+
+def _key(folder, create=False):
+    path = pathlib.Path(folder) / KEY
+    try:
+        return path.read_bytes()
+    except OSError:
+        if not create:
+            return None
+    key = secrets.token_bytes(32)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(key)
+    return key
+
+
+def _mac(key, info):
+    body = json.dumps({k: v for k, v in info.items() if k != "signature"}, sort_keys=True).encode()
+    return hmac.new(key, body, hashlib.sha256).hexdigest()
+
+
+def sign(folder, info):
+    return dict(info, signature=_mac(_key(folder, create=True), info))
+
+
+def check(folder, info, chunks, mode):
+    """Why THIS process must not serve this index ([] = it may). In enforce mode every problem
+    is a refusal; in report mode (development) the caller only warns."""
+    problems = []
+    key = _key(folder)
+    if not info.get("signature") or not key or not hmac.compare_digest(info["signature"], _mac(key, info)):
+        problems.append("unverified:signature")
+    if info.get("policy_version") != POLICY_VERSION:
+        problems.append(f"policy_version:{info.get('policy_version')}!={POLICY_VERSION}")
+    if info.get("fingerprint") != fingerprint(chunks):
+        problems.append("content_mismatch")
+    if mode == "enforce":
+        if info.get("security_mode") != "enforce":
+            problems.append(f"built_in_{info.get('security_mode') or 'unknown'}_mode")
+        untrusted = sum(1 for c in chunks if c.get("trust") not in TRUSTED)
+        if untrusted:
+            problems.append(f"untrusted_chunks:{untrusted}")
+    return problems

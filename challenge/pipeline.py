@@ -15,6 +15,7 @@ Given to you (helpers.py):  embed(texts) -> normalized vectors · llm(system, us
 Stuck or behind?  cp challenge/checkpoints/level3.py challenge/pipeline.py   (naive RAG, done)
 """
 import collections
+import os
 import pathlib
 import re
 import threading
@@ -443,9 +444,16 @@ def build_index(chunks):
     and only then activates it (chroma_db/ACTIVE.json) and switches all of them together. If any
     step fails, the previous index stays active, on disk and here, and the error says so."""
     import chromadb
-    from security import access, index_store, retention
+    import security
+    from security import access, index_store, ingest_guard, retention
     global LAST_BUILD_FAILED
     folder = HERE / "chroma_db"
+    mode = ingest_guard.mode()
+    if mode == "enforce":                              # final review: an enforce index holds trusted CVs only
+        untrusted = sorted({c["source"] for c in chunks if c.get("trust") not in index_store.TRUSTED})
+        if untrusted:
+            raise index_store.IndexBuildFailed(f"enforce mode: {len(untrusted)} CV(s) without an accepted or "
+                                               "reviewed verdict cannot be indexed; the previous index is unchanged")
     with index_store.writer_lock(folder):
         client = chromadb.PersistentClient(path=str(folder))
         old = index_store.read_active(folder) or {}
@@ -463,8 +471,13 @@ def build_index(chunks):
             if problems:
                 raise index_store.IndexBuildFailed("the new index failed its checks: " + ", ".join(problems))
             bm25, graph = make_bm25(chunks, version=name), make_graph(chunks, version=name)
-            info = {"collection": name, "previous": old.get("collection"), "chunks": len(chunks),
-                    "documents": len({c.get("doc_id", c["source"]) for c in chunks}), "built_at": time.time()}
+            trust = collections.Counter(c.get("trust", "unknown") for c in {c.get("doc_id", c["source"]): c for c in chunks}.values())
+            info = index_store.sign(folder, {
+                "collection": name, "previous": old.get("collection"), "chunks": len(chunks),
+                "documents": len({c.get("doc_id", c["source"]) for c in chunks}), "built_at": time.time(),
+                # final review: what this version was built under, checked by every reader (index_store.check)
+                "security_mode": mode, "policy_version": security.POLICY_VERSION, "trust": dict(trust),
+                "fingerprint": index_store.fingerprint(chunks), "built_by": {"pid": os.getpid(), "role": "writer"}})
             access.save(folder, name, {d: CONTACTS.get(d, []) for d in {c.get("doc_id") for c in chunks} if d})
             index_store.activate(folder, info)
         except Exception as e:
@@ -500,7 +513,7 @@ def attach_index():
     Never creates or deletes a collection and never reads the CV files. Raises IndexNotReady
     when nothing has been built yet. The new state is prepared first and switched in one step."""
     import chromadb
-    from security import index_store
+    from security import index_store, ingest_guard
     info = index_store.read_active(HERE / "chroma_db")
     if not info:
         raise index_store.IndexNotReady("no CV index yet: build it with the app (python challenge/app.py, "
@@ -509,6 +522,14 @@ def attach_index():
     chunks = read_active_chunks(collection)
     if len(chunks) != info.get("chunks", len(chunks)):
         raise index_store.IndexNotReady("the active index is incomplete: rebuild it with the app")
+    # final review: never serve an index built under another mode or policy, or one that was changed
+    mode = ingest_guard.mode()
+    problems = index_store.check(HERE / "chroma_db", info, chunks, mode)
+    if problems and mode == "enforce":
+        raise index_store.IndexRejected("the active index cannot be served in enforce mode (" + ", ".join(problems)
+                                        + "): rebuild it with the app in enforce mode")
+    if problems:
+        print("attach_index: WARNING (report mode only): " + ", ".join(problems))
     install(collection, make_bm25(chunks, version=info["collection"]), make_graph(chunks, version=info["collection"]), info)
     return chunks
 
@@ -517,7 +538,14 @@ def refresh_index():
     """Re-attach when the writer has activated a newer index (a reader's index is never stale)."""
     from security import index_store
     info = index_store.read_active(HERE / "chroma_db")
-    if info and info.get("collection") != (ACTIVE_INFO.get("info") or {}).get("collection"):
+    mine = ACTIVE_INFO.get("info") or {}
+    if info and info.get("collection") != mine.get("collection"):
+        attach_index()
+        return True
+    index_store.renew()                                # this reader is alive: keep its version
+    try:
+        COLLECTION.count()                             # still there? (a lease can only lapse if the
+    except Exception:                                   # noqa: BLE001 · process stalled for over LEASE_S)
         attach_index()
         return True
     return False
