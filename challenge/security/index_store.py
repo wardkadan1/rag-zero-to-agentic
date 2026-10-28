@@ -59,7 +59,9 @@ class IndexRejected(IndexNotReady):
 @contextlib.contextmanager
 def writer_lock(folder):
     folder = pathlib.Path(folder)
-    folder.mkdir(parents=True, exist_ok=True)
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(folder, 0o700)                        # final review: CV text and vectors are owner-only
     fd = os.open(folder / LOCK, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         try:

@@ -65,6 +65,12 @@ def test_the_access_log_never_stores_contact_details_from_the_purpose(tmp_path, 
     assert stat.S_IMODE((tmp_path / "chroma_db" / access.LOG).stat().st_mode) == 0o600
 
 
+def test_the_index_folder_and_the_security_report_are_owner_only(tmp_path):
+    build(tmp_path, {"Maya_Tester.md": CONTACT_CV})
+    assert stat.S_IMODE((tmp_path / "chroma_db").stat().st_mode) == 0o700
+    assert stat.S_IMODE((tmp_path / "quarantine.json").stat().st_mode) == 0o600
+
+
 def test_access_docstring_says_development_only():
     assert "DEVELOPMENT ONLY" in access.__doc__ and "PROCESS" in access.__doc__
     assert (CHALLENGE / "security" / "CONTACT_ACCESS.md").exists()

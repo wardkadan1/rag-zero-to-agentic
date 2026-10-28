@@ -255,6 +255,8 @@ def write_report(decisions, path=None):
     rows = [{"source": d.source, "verdict": d.verdict, "status": d.status, "reasons": d.reasons, "flags": d.flags, "sha256": d.sha256,
              "size": d.size, "review": d.review, "ingested": d.ingest} for d in decisions if d.status != "accept"]
     try:
+        path.touch(mode=0o600)
+        os.chmod(path, 0o600)                          # file names are often people's names: owner-only
         path.write_text(json.dumps({"mode": mode(), "files": rows}, indent=1, ensure_ascii=False), encoding="utf-8")
     except OSError as e:
         print(f"security: could not write {path}: {e}")
