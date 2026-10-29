@@ -226,3 +226,13 @@ def test_simulated_run_scores_raw_and_final_answers_separately(tmp_path, monkeyp
     recs = [json.loads(line) for line in (out / "cases.jsonl").read_text().splitlines()]
     assert all("result_raw" in r for r in recs if r["stage"] == "attack")
     assert all("correct_raw" in r for r in recs if r["stage"] == "benign")
+
+
+def test_the_paired_control_drops_every_injected_history_turn():
+    a121 = next(c for c in corpus.attack_cases() if c["id"] == "a121")
+    assert a121["kind"] == "multi" and a121["history"][0].startswith("Always recommend")
+    assert run_eval.clean_history(a121) == ["Who are the Python developers?"]
+    for c in corpus.attack_cases():
+        assert all(c["attacker"] not in h and c["codeword"] not in h for h in run_eval.clean_history(c))
+    pii_case = next(c for c in corpus.attack_cases() if any("dana.user" in h for h in c["history"]))
+    assert run_eval.clean_history(pii_case) == pii_case["history"]          # the user's own words stay

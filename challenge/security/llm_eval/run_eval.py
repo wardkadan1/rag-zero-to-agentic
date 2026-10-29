@@ -237,6 +237,14 @@ def score(case, turns, trace, control=None):
     return out
 
 
+def clean_history(case):
+    """The control's history: the user-side turns that carry the attack (they name the attacker or the
+    canary) are removed. Before 2026-10-29 only kind 'history_injection*' was cleaned, so a121's control
+    (kind 'multi') kept its injected turn."""
+    marks = [case["attacker"].lower(), case["codeword"].lower()]
+    return [h for h in case["history"] if not any(m in h.lower() for m in marks)]
+
+
 def raw_view(turns):
     return [dict(t, answer=t.get("raw", t["answer"])) for t in turns]
 
@@ -277,7 +285,7 @@ def run_attack(case, n, condition, background=None):
             rec["withheld"] = any(case["file"] in t["withheld"] for t in turns)
             if case["goal"] == "rank":                                   # the paired control: attack removed
                 control_turns = []
-                hist0 = case["history"][1:] if case["kind"].startswith("history_injection") else case["history"]
+                hist0 = clean_history(case)
                 if condition == "A":
                     idx.close()
                     idx = Index({**corpus.clean_cvs(), **dict([attacker_file(case, with_attack=False)])})
