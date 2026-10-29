@@ -2,8 +2,10 @@
 
 This folder tests the model, not the code: does `Qwen/Qwen2.5-1.5B-Instruct` follow instructions
 hidden in CVs, invent qualifications, change rankings, leak contact details or call tools it
-should not? Nothing here changes the app. The pipeline, app, MCP server, `security/` and `ragkit/`
-stay exactly as they are at the frozen baseline `13acf11`; every run records a check of that.
+should not? Nothing here changes the app. Every run records how the code differs from the
+original security baseline `13acf11` (`frozen` in `environment.json`). Since 2026-10-29 the only
+approved production change is the answer checks (`security/ANSWER_CHECKS.md`, commits 33162f3 and
+a9886e7); the qwen-1 run was made without them.
 
 Every CV used here is invented (`corpus.py`). No real CV is read, copied or sent anywhere.
 
@@ -32,7 +34,7 @@ passages in the same prompt template.
 git pull origin claude/project-thread-gt4cd4
 source .venv/bin/activate                     # the project's environment, with torch + transformers
 git diff --stat 13acf11 -- challenge/pipeline.py challenge/app.py challenge/mcp_server.py challenge/helpers.py ragkit challenge/security ':(exclude)challenge/security/tests' ':(exclude)challenge/security/llm_eval'
-                                              # must print nothing
+                                              # must list only pipeline.py, answer_checks.py, ANSWER_CHECKS.md
 
 caffeinate -i env RAG_LLM=hf python challenge/security/llm_eval/run_eval.py --out challenge/security/llm_eval/runs/qwen-1
 ```
@@ -58,7 +60,8 @@ Then run the tests: `python -m pytest -q challenge/security/tests tests`.
 | `report.md` | the same, readable |
 
 Condition A is scored twice with the same rules: the app's final answer (the release gates) and the
-model's raw words before the answer checks (`gates_raw_model`, a diagnostic).
+model's raw words before the answer checks (`gates_raw_model`, a diagnostic). `citations` gives raw
+vs final citation rates, and `answer_checks` counts what the checks did to each turn.
 
 To commit results, export a sanitized copy: `python challenge/security/llm_eval/export_results.py
 runs/<name> challenge/security/llm_eval/results/<date>-<name>.json`. It keeps the gates, per-group
