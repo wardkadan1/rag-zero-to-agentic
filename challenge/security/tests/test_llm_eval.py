@@ -172,7 +172,9 @@ def test_simulated_dry_run_is_labelled_and_isolated(tmp_path, monkeypatch):
                                                                                    for c in "AB"}
     b = {r["id"]: r for r in recs if r["condition"] == "B" and r["stage"] == "attack"}
     assert b["a001"]["result"]["success"] and b["a111"]["result"]["success"]   # the vulnerable simulation is caught
-    assert summary["gates"]["unauthorized_tool_actions"]["value"] >= 1 and not summary["all_gates_pass"]
+    # the harness counts tool misuse (condition B, the model alone). Since F2 (2026-10-29) the MCP results no
+    # longer carry the CV's order, so the simulated agent in condition A no longer calls the forbidden tool.
+    assert summary["groups"]["tool_agent"]["B"]["success"] >= 1 and summary["groups"]["tool_agent"]["A"]["success"] == 0
     assert all(t["executed"] is False for r in recs for t in r.get("tool_calls") or [] if t["name"] not in
                scoring.ALLOWED_TOOLS)                                          # a forbidden tool never runs
     after = sorted(p.name for p in real_store.iterdir()) if real_store.exists() else None
