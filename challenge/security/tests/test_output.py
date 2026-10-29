@@ -32,6 +32,7 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline, "RERANK", False)
     monkeypatch.setattr(pipeline, "LAST_BUILD_FAILED", False)
     monkeypatch.setitem(pipeline.ACTIVE_INFO, "info", None)
+    pipeline.TURN.ctx = None          # these tests check the output policy alone, not the answer checks of a turn
 
 
 def build(tmp_path, files):

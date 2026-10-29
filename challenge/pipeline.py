@@ -828,8 +828,12 @@ def build_prompt(question, hits):
     """The text the LLM receives: the numbered passages, then the question.
     SECURITY · Phase 5: the passages are marked as untrusted data, their text cannot fake a
     passage number or the end of the block, contact details are masked, and a passage that
-    talks to the AI is replaced by a note."""
+    talks to the AI is replaced by a note.
+    SECURITY · remediation 2026-10-29: the question and passages of this turn are remembered (per
+    thread) so safe_answer can check the model's answer against them."""
     from security import output_guard, pii
+    TURN.ctx = {"question": question, "query": getattr(TURN, "query", None), "hits": list(hits)}
+    TURN.query = None
     def body(h):
         if h.get("withheld") or output_guard.passage_risk(h["text"]):
             return "(passage withheld: it contains instructions aimed at an AI)"
@@ -858,9 +862,29 @@ def redact_export(obj):
     return obj
 
 
+ANSWER_CHECKS = True      # SECURITY · remediation 2026-10-29: False = show the model's answer as it is (to compare)
+TURN = threading.local()  # this thread's current turn: make_query → build_prompt → safe_answer (app.rag's order)
+
+
+def check_answer(text, ctx):
+    """SECURITY · remediation 2026-10-29 · the model's answer is a draft (security/answer_checks.py):
+    a ranking request gets a ranking computed from CV evidence, never the model's."""
+    from security import answer_checks
+    question, hits = ctx["question"], ctx["hits"]
+    names = sorted({c.get("name") for c in BM25.get("chunks", []) if c.get("name")})
+    if answer_checks.is_ranking_request(question):
+        TURN.report = {"check": "ranking_by_evidence"}
+        return answer_checks.rank_by_evidence(ctx.get("query") or question, hits, years_of_experience, SKILLS, names)
+    return text
+
+
 def safe_answer(text):
-    """SECURITY · Phase 5 · what the app may show: PII policy, then no HTML, images or links."""
+    """SECURITY · Phase 5 · what the app may show: PII policy, then no HTML, images or links.
+    Remediation 2026-10-29: first the answer checks, when this thread built the turn's prompt."""
     from security import output_guard, pii
+    ctx, TURN.ctx, TURN.report = getattr(TURN, "ctx", None), None, None
+    if ANSWER_CHECKS and ctx is not None:
+        text = check_answer(text, ctx)
     return output_guard.safe_markdown(pii.redact(text))
 
 
@@ -890,6 +914,7 @@ def make_query(question, history):
     """STEP 1 · Follow-ups: rewrite "and where did he study?" using `history` (earlier questions)."""
     from security import pii                          # final review: the user's own text passes the PII policy
     question, history = pii.redact(question), [pii.redact(q) for q in history or []]
+    TURN.query = TURN.ctx = None                      # remediation 2026-10-29: a new turn; no earlier prompt is checked against
     if not history or not FOLLOW_UP.search(question):
         return question                               # a stand-alone question: search it as it is
     previous = history[-1]
@@ -900,11 +925,13 @@ def make_query(question, history):
             earlier = "\n".join(f"- {q}" for q in history[-3:])
             rewritten = llm(REWRITE_PROMPT, f"Earlier questions:\n{earlier}\n\nLast question: {question}", 60).strip()
             if 0 < len(rewritten) < 300:
+                TURN.query = rewritten                # remediation 2026-10-29: the answer check knows who "that candidate" is
                 return rewritten
     except Exception as e:
         print("make_query: LLM rewrite failed, using the rule:", e)
     # Rule: the person is named or described in the previous question, so search both together.
-    return f"{previous} {question}"
+    TURN.query = f"{previous} {question}"
+    return TURN.query
 
 
 REFUSE_BELOW = -9.5       # STEP 6: cross-encoder score of the best chunk under which we refuse
