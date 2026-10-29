@@ -216,8 +216,21 @@ def test_worker_environment_has_no_credentials(tmp_path, monkeypatch):
     monkeypatch.setenv("HF_TOKEN", "do-not-leak")
     worker = fake_worker(tmp_path, 'print(json.dumps({"ok": True, "text": json.dumps(dict(os.environ)), "pages": 0}))')
     env = json.loads(sandbox.parse_all([job()], worker=worker)["a.txt"]["text"])
-    assert "do-not-leak" not in json.dumps(env) and set(env) <= {"PATH", "LANG", "LC_ALL", "HOME", "TMPDIR", "LC_CTYPE",
-                                                                 "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"}
+    allowed = {"PATH", "LANG", "LC_ALL", "HOME", "TMPDIR", "LC_CTYPE", "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"}
+    if sys.platform == "darwin":
+        allowed.add("__CF_USER_TEXT_ENCODING")        # macOS adds it to every process (a text-encoding hint, no secret)
+    assert "do-not-leak" not in json.dumps(env) and set(env) <= allowed
+    assert not {"AWS_SECRET_ACCESS_KEY", "HF_TOKEN"} & set(env)
+
+
+def test_only_the_macos_encoding_variable_is_tolerated(tmp_path, monkeypatch):
+    """The macOS allowance is one exact name: a look-alike, or a credential set beside it, still fails."""
+    monkeypatch.setenv("HF_TOKEN", "do-not-leak")
+    worker = fake_worker(tmp_path, 'print(json.dumps({"ok": True, "text": json.dumps(dict(os.environ)), "pages": 0}))')
+    env = json.loads(sandbox.parse_all([job()], worker=worker)["a.txt"]["text"])
+    assert set(env) - {"__CF_USER_TEXT_ENCODING"} <= {"PATH", "LANG", "LC_ALL", "HOME", "TMPDIR", "LC_CTYPE",
+                                                      "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"}
+    assert "HF_TOKEN" not in env and not any(k.startswith("__CF_") and k != "__CF_USER_TEXT_ENCODING" for k in env)
 
 
 def test_lock_down_blocks_network_processes_writes_and_outside_reads(tmp_path):
