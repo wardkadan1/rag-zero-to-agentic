@@ -868,14 +868,18 @@ TURN = threading.local()  # this thread's current turn: make_query → build_pro
 
 def check_answer(text, ctx):
     """SECURITY · remediation 2026-10-29 · the model's answer is a draft (security/answer_checks.py):
-    a ranking request gets a ranking computed from CV evidence, never the model's."""
+    a ranking request gets a ranking computed from CV evidence, never the model's; any other answer
+    keeps only the statements a passage supports, each cited; nothing supported → REFUSAL."""
     from security import answer_checks
     question, hits = ctx["question"], ctx["hits"]
     names = sorted({c.get("name") for c in BM25.get("chunks", []) if c.get("name")})
     if answer_checks.is_ranking_request(question):
         TURN.report = {"check": "ranking_by_evidence"}
         return answer_checks.rank_by_evidence(ctx.get("query") or question, hits, years_of_experience, SKILLS, names)
-    return text
+    out, report = answer_checks.check_grounding(text, question, ctx.get("query"), hits, names,
+                                                answer_checks.idf_of(BM25.get("idf")))
+    TURN.report = dict(report, check="grounding")
+    return out
 
 
 def safe_answer(text):
