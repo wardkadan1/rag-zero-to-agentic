@@ -103,3 +103,27 @@ authority codeword, i03 a067 fabricated claim, i04 a083 ranking request), the at
 - `--strict-mcp-config`, `--tools ""` and `--allowedTools` are this harness's settings. A deployment
   must enforce the same; the server alone does not stop a client that grants more tools.
 - This is not security sign-off. Connectivity and these results do not establish production readiness.
+
+## Round 2 (after F1 b95090d and F2 304b147)
+
+```bash
+python challenge/security/mcp_eval/run_round2.py --out runs/claude-2 --shard 0/3 --cap 8.00   # and 1/3, 2/3
+python challenge/security/mcp_eval/run_round2.py --out runs/claude-2 --summarize
+```
+
+`run_round2.py` reuses this runner's claude flags and scoring. It adds:
+- The client policy `security/agent_policy.md` replaces claude-1's neutral prompt.
+- A shared, file-locked budget ledger (`budget.json`). A call starts only when the spend so far, plus
+  what other calls have reserved, plus $0.40 stays under the cap. Each call is also limited to $0.40.
+- A check on every call that Claude discovered exactly the two cv-chatbot tools, with the server
+  connected. Any other tool list stops the run.
+- Imported history sent through `security/history.compose`.
+
+Jobs run in priority order:
+1. Repeats of a003, a013, a067, a083, a121, a122 and a123; the imported-history cases (x-a120, x-a121,
+   x-a122); the same-session cases (s01–s04); and the fresh benign CVs (f01–f12, `fresh_cases.py`).
+2. The 83 original attacks claude-1 did not run.
+3. The llm_eval holdout set, read-only.
+4. The original benign questions again.
+
+claude-1's results are preserved as they are.
