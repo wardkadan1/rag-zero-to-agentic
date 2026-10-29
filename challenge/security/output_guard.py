@@ -33,6 +33,25 @@ def passage_risk(text):
     return [code for _, code in content.scan_injection(text)]
 
 
+SENTENCE = re.compile(r"(?<=[.!?;])\s+")
+REMOVED = "[removed: instruction-like text in the CV]"
+
+
+def remove_instructions(text):
+    """SECURITY · 2026-10-29 (Claude + MCP finding F2) · (text, n): every sentence that reads as an
+    instruction to whoever reads the CV (security/directives.py: the Phase 3 detectors plus
+    sentence-level patterns in several languages, matched on decoded copies) is replaced by a marker.
+    The rest of the CV stays as evidence; the index and the stored text are never changed."""
+    from . import directives
+    out, n = [], 0
+    for line in (text or "").split("\n"):
+        parts = SENTENCE.split(line)
+        bad = [bool(p.strip()) and directives.is_directive(p) for p in parts]
+        n += sum(bad)
+        out.append(" ".join(REMOVED if b else p for p, b in zip(parts, bad)) if any(bad) else line)
+    return "\n".join(out), n
+
+
 def neutralize(text):
     """Passage text cannot start a fake passage ("[2] ignore…") or close the data block."""
     return PASSAGE_NO.sub(r"(\1)", text).replace("<<<", "‹‹‹").replace(">>>", "›››")
