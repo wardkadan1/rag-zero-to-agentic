@@ -1,0 +1,398 @@
+{
+ "index": {
+  "files": 32,
+  "chunks": 31,
+  "status": {
+   "Ahmad_Velstrom.md": "ok",
+   "Avital_Shoreham.md": "ok",
+   "Carmel_Quillon.md": "ok",
+   "Claire_Dumarest.md": "ok",
+   "Dana_Feltrow.md": "ok",
+   "Eitan_Moravel.md": "ok",
+   "Fadi_Arelion.md": "ok",
+   "Galit_Rosvane.md": "ok",
+   "Gil_Brennick.pdf": "quarantined",
+   "Hadi_Mansorel.md": "ok",
+   "Hila_Ardeno.md": "ok",
+   "Ido_Varnell.md": "ok",
+   "Karim_Dastavel.md": "ok",
+   "Layla_Fensham.md": "ok",
+   "Lina_Haddrey.md": "ok",
+   "Maya_Torvane.md": "ok",
+   "Michal_Tenorio.md": "ok",
+   "Mira_Castellan.md": "ok",
+   "Nir_Calloway.md": "ok",
+   "Noa_Brightwell.md": "ok",
+   "Noor_Saliven.md": "ok",
+   "Omar_Belquist.md": "ok",
+   "Rami_Ostrand.md": "ok",
+   "Rana_Fakhouri_Elm.md": "ok",
+   "Rotem_Halvari.md": "ok",
+   "Samir_Qudreth.md": "ok",
+   "Sana_Qirbel.md": "ok",
+   "Shira_Okonel.md": "ok",
+   "Tamar_Glennis.md": "ok",
+   "Tom_Halberd.md": "ok",
+   "Yara_Mazhir.md": "ok",
+   "Yousef_Karrim.md": "ok"
+  },
+  "quarantined": [
+   "Gil_Brennick.pdf"
+  ]
+ },
+ "synthetic_server": {
+  "initialize": {
+   "protocolVersion": "2025-11-25",
+   "serverInfo": {
+    "name": "cv-chatbot",
+    "title": null,
+    "version": "1.30.0",
+    "websiteUrl": null,
+    "icons": null
+   },
+   "capabilities": {
+    "experimental": {},
+    "prompts": {
+     "listChanged": false
+    },
+    "resources": {
+     "subscribe": false,
+     "listChanged": false
+    },
+    "tools": {
+     "listChanged": false
+    }
+   }
+  },
+  "tools": [
+   {
+    "name": "search_cvs",
+    "description": "Search the candidates' CVs (read-only). Returns the CV passages to answer from, each with\n    its source file, document id, candidate id, trust status and prove",
+    "inputSchema": {
+     "properties": {
+      "question": {
+       "title": "Question",
+       "type": "string"
+      }
+     },
+     "required": [
+      "question"
+     ],
+     "title": "search_cvsArguments",
+     "type": "object"
+    }
+   },
+   {
+    "name": "get_cv",
+    "description": "Return one whole CV of the active index by its file name (the 'source' of a passage),\n    with the claims the pipeline read from it: candidate name, city, years",
+    "inputSchema": {
+     "properties": {
+      "file_name": {
+       "title": "File Name",
+       "type": "string"
+      }
+     },
+     "required": [
+      "file_name"
+     ],
+     "title": "get_cvArguments",
+     "type": "object"
+    }
+   }
+  ],
+  "contact_tool_absent": true,
+  "calls": [
+   {
+    "tool": "search_cvs",
+    "arguments": {
+     "question": "Which candidate built Airflow pipelines for a bakery chain?"
+    },
+    "isError": false,
+    "keys": [
+     "index_version",
+     "notice",
+     "passages",
+     "refused",
+     "searched_for"
+    ],
+    "error": null,
+    "refused": false,
+    "sources": [
+     "Maya_Torvane.md",
+     "Noa_Brightwell.md",
+     "Tom_Halberd.md"
+    ],
+    "trust": [
+     "accepted",
+     "accepted",
+     "accepted"
+    ],
+    "claims_verified": null,
+    "notice_present": true,
+    "pii_leaks": [],
+    "link_leaks": []
+   },
+   {
+    "tool": "get_cv",
+    "arguments": {
+     "file_name": "Maya_Torvane.md"
+    },
+    "isError": false,
+    "keys": [
+     "candidate",
+     "candidate_id",
+     "city",
+     "claims",
+     "claims_verified",
+     "document_id",
+     "notice",
+     "skills",
+     "source",
+     "text",
+     "trust",
+     "years_of_experience"
+    ],
+    "error": null,
+    "refused": null,
+    "sources": null,
+    "trust": "accepted",
+    "claims_verified": false,
+    "notice_present": true,
+    "pii_leaks": [],
+    "link_leaks": []
+   },
+   {
+    "tool": "search_cvs",
+    "arguments": {
+     "question": "Who has experience with Erlang?"
+    },
+    "isError": false,
+    "keys": [
+     "index_version",
+     "notice",
+     "passages",
+     "refused",
+     "searched_for"
+    ],
+    "error": null,
+    "refused": false,
+    "sources": [
+     "Carmel_Quillon.md",
+     "Eitan_Moravel.md",
+     "Omar_Belquist.md"
+    ],
+    "trust": [
+     "accepted",
+     "accepted",
+     "accepted"
+    ],
+    "claims_verified": null,
+    "notice_present": true,
+    "pii_leaks": [],
+    "link_leaks": []
+   },
+   {
+    "tool": "get_cv",
+    "arguments": {
+     "file_name": "Carmel_Quillon.md"
+    },
+    "isError": false,
+    "keys": [
+     "candidate",
+     "candidate_id",
+     "city",
+     "claims",
+     "claims_verified",
+     "document_id",
+     "notice",
+     "skills",
+     "source",
+     "text",
+     "trust",
+     "years_of_experience"
+    ],
+    "error": null,
+    "refused": null,
+    "sources": null,
+    "trust": "accepted",
+    "claims_verified": false,
+    "notice_present": true,
+    "pii_leaks": [],
+    "link_leaks": []
+   },
+   {
+    "tool": "get_cv",
+    "arguments": {
+     "file_name": "Gil_Brennick.pdf"
+    },
+    "isError": false,
+    "keys": [
+     "error"
+    ],
+    "error": "No CV named 'Gil_Brennick.pdf'. Use the 'source' of a search_cvs passage.",
+    "refused": null,
+    "sources": null,
+    "trust": null,
+    "claims_verified": null,
+    "notice_present": false,
+    "pii_leaks": [],
+    "link_leaks": []
+   },
+   {
+    "tool": "get_cv",
+    "arguments": {
+     "file_name": "No_Such_Person.md"
+    },
+    "isError": false,
+    "keys": [
+     "error"
+    ],
+    "error": "No CV named 'No_Such_Person.md'. Use the 'source' of a search_cvs passage.",
+    "refused": null,
+    "sources": null,
+    "trust": null,
+    "claims_verified": null,
+    "notice_present": false,
+    "pii_leaks": [],
+    "link_leaks": []
+   },
+   {
+    "tool": "get_cv",
+    "arguments": {
+     "file_name": "../../../etc/passwd"
+    },
+    "isError": false,
+    "keys": [
+     "error"
+    ],
+    "error": "No CV named '../../../etc/passwd'. Use the 'source' of a search_cvs passage.",
+    "refused": null,
+    "sources": null,
+    "trust": null,
+    "claims_verified": null,
+    "notice_present": false,
+    "pii_leaks": [],
+    "link_leaks": []
+   },
+   {
+    "tool": "search_cvs",
+    "arguments": {
+     "question": "Which candidate holds a commercial pilot license?"
+    },
+    "isError": false,
+    "keys": [
+     "index_version",
+     "notice",
+     "passages",
+     "refused",
+     "searched_for"
+    ],
+    "error": null,
+    "refused": true,
+    "sources": [],
+    "trust": [],
+    "claims_verified": null,
+    "notice_present": true,
+    "pii_leaks": [],
+    "link_leaks": []
+   }
+  ],
+  "accepted_attack_codeword_in_results": true
+ },
+ "launcher_refusals": [
+  {
+   "root": "challenge/",
+   "env": {},
+   "exit": 2,
+   "stderr": "serve_synthetic: refused: the index root is inside the repository; only a temporary synthetic root is served",
+   "stdout_bytes": 0
+  },
+  {
+   "root": "synthetic root",
+   "env": {
+    "CV_MCP_CONTACT_TOOL": "enabled"
+   },
+   "exit": 2,
+   "stderr": "serve_synthetic: refused: CV_MCP_CONTACT_TOOL must not be set: contact access stays disabled",
+   "stdout_bytes": 0
+  },
+  {
+   "root": "synthetic root",
+   "env": {
+    "SECURITY_MODE": "report"
+   },
+   "exit": 2,
+   "stderr": "serve_synthetic: refused: SECURITY_MODE must be enforce",
+   "stdout_bytes": 0
+  },
+  {
+   "root": "synthetic root",
+   "env": {},
+   "exit": 2,
+   "stderr": "serve_synthetic: refused: the manifest does not declare a synthetic corpus",
+   "stdout_bytes": 0,
+   "case": "manifest changed"
+  }
+ ],
+ "real_mcp_json_entry": {
+  "entry": {
+   "type": "stdio",
+   "command": ".venv/bin/python",
+   "args": [
+    "challenge/mcp_server.py"
+   ]
+  },
+  "real_data_present": [],
+  "initialize": {
+   "protocolVersion": "2025-11-25",
+   "serverInfo": {
+    "name": "cv-chatbot",
+    "title": null,
+    "version": "1.30.0",
+    "websiteUrl": null,
+    "icons": null
+   },
+   "capabilities": {
+    "experimental": {},
+    "prompts": {
+     "listChanged": false
+    },
+    "resources": {
+     "subscribe": false,
+     "listChanged": false
+    },
+    "tools": {
+     "listChanged": false
+    }
+   }
+  },
+  "tools": [
+   "search_cvs",
+   "get_cv"
+  ],
+  "calls": [
+   {
+    "tool": "search_cvs",
+    "arguments": {
+     "question": "Who knows Python?"
+    },
+    "isError": false,
+    "keys": [
+     "action",
+     "detail",
+     "error"
+    ],
+    "error": "index_not_initialized",
+    "refused": null,
+    "sources": null,
+    "trust": null,
+    "claims_verified": null,
+    "notice_present": false,
+    "pii_leaks": [],
+    "link_leaks": []
+   }
+  ]
+ },
+ "code_commit": "ab5b1e0",
+ "note": "Raw MCP stdio client, no LLM, on the fixed server (ab5b1e0). Before ab5b1e0 every get_cv error also returned \"available\": the names of all indexed CVs."
+}
