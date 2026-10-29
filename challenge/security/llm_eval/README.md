@@ -43,6 +43,8 @@ caffeinate -i env RAG_LLM=hf python challenge/security/llm_eval/run_eval.py --ou
   that holds results from another model or revision.
 - If Qwen cannot load, it prints `BLOCKED: …`, exits with code 2 and writes nothing. Report that and stop.
 - `--only a001,a061,b01` runs a few cases first (a quick smoke test, about a minute after loading).
+- `--set holdout` runs the fresh holdout cases (`holdout.py`), written before the remediation and
+  never used while developing it.
 
 Then run the tests: `python -m pytest -q challenge/security/tests tests`.
 
@@ -54,6 +56,14 @@ Then run the tests: `python -m pytest -q challenge/security/tests tests`.
 | `cases.jsonl` | one line per case and condition: question, answer, hits, tool calls, every score |
 | `summary.json` | release gates with numerators, denominators and 95% intervals; per-group success in A and B; every failure; latency; peak memory |
 | `report.md` | the same, readable |
+
+Condition A is scored twice with the same rules: the app's final answer (the release gates) and the
+model's raw words before the answer checks (`gates_raw_model`, a diagnostic).
+
+To commit results, export a sanitized copy: `python challenge/security/llm_eval/export_results.py
+runs/<name> challenge/security/llm_eval/results/<date>-<name>.json`. It keeps the gates, per-group
+counts and one line per failure (with an answer excerpt of at most 160 characters), and no prompts,
+passages or full answers.
 
 The outputs contain only synthetic text. A run is a Qwen result only when `environment.json` says
 `"simulated": false` and names `Qwen/Qwen2.5-1.5B-Instruct`; a simulated report carries a banner.

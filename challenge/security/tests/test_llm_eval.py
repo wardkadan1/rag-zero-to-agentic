@@ -177,3 +177,52 @@ def test_simulated_dry_run_is_labelled_and_isolated(tmp_path, monkeypatch):
                scoring.ALLOWED_TOOLS)                                          # a forbidden tool never runs
     after = sorted(p.name for p in real_store.iterdir()) if real_store.exists() else None
     assert before == after                                                     # the real index was never touched
+
+
+# ------------------------------------------------------------------ harness corrections (2026-10-29)
+def test_every_harness_file_parses_on_python_3_11():
+    import ast
+    for path in sorted((CHALLENGE / "security" / "llm_eval").glob("*.py")):
+        ast.parse(path.read_text(), filename=str(path), feature_version=(3, 11))
+
+
+def test_cache_revision_needs_the_snapshot_and_refs_main_to_agree(tmp_path, monkeypatch):
+    import huggingface_hub
+    sha = "989aa7980e4cf806f80c7fef2b1adb7bc71aa306"
+    snap = tmp_path / "models--x--y" / "snapshots" / sha
+    snap.mkdir(parents=True)
+    (snap / "config.json").write_text("{}")
+    (tmp_path / "models--x--y" / "refs").mkdir()
+    ref = tmp_path / "models--x--y" / "refs" / "main"
+    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache", lambda repo, name: str(snap / name))
+    ref.write_text(sha + "\n")
+    assert backends.cache_revision("x/y") == {"repo": "x/y", "snapshot": sha, "refs_main": sha, "verified": True}
+    ref.write_text("0" * 40)
+    assert backends.cache_revision("x/y")["verified"] is False
+    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache", lambda repo, name: None)
+    assert backends.cache_revision("x/y")["verified"] is False
+
+
+def test_export_keeps_no_prompts_passages_or_full_answers(tmp_path):
+    sys.path.insert(0, str(CHALLENGE / "security" / "llm_eval"))
+    import export_results
+    long = "Maya Torvane, e-mail maya.torvane@example.net, " + "x" * 400
+    summary = {"environment": {"simulated": True, "label": "s", "started": "t", "model": {}, "frozen": {}, "corpus": {}},
+               "gates": {}, "groups": {}, "all_gates_pass": False,
+               "failures": {"A": [{"id": "a1", "group": "g", "severity": "high", "goal": "rank", "answer": long,
+                                   "pii": ["maya.torvane@example.net"], "prompt": "SECRET PROMPT"}]}}
+    (tmp_path / "summary.json").write_text(json.dumps(summary))
+    out = json.dumps(export_results.export(tmp_path))
+    assert "SECRET PROMPT" not in out and "maya.torvane@example.net" not in out and "x" * 200 not in out
+    assert '"pii_leak_count": 1' in out
+
+
+def test_simulated_run_scores_raw_and_final_answers_separately(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "stderr", open(os.devnull, "w"))
+    out = tmp_path / "run"
+    assert run_eval.main(["--simulate", "--only", "a079,b01,u01", "--conditions", "A", "--out", str(out)]) == 0
+    summary = json.loads((out / "summary.json").read_text())
+    assert set(summary["gates_raw_model"]) == set(summary["gates"])
+    recs = [json.loads(line) for line in (out / "cases.jsonl").read_text().splitlines()]
+    assert all("result_raw" in r for r in recs if r["stage"] == "attack")
+    assert all("correct_raw" in r for r in recs if r["stage"] == "benign")

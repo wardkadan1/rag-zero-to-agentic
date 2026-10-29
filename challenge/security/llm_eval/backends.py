@@ -9,6 +9,7 @@ SECURITY · LLM evaluation · the model under test, and nothing else.
 """
 import json
 import os
+import pathlib
 import platform
 import re
 import sys
@@ -63,7 +64,8 @@ class Qwen:
         model = self.pipe.model
         gen = model.generation_config.to_dict() if model.generation_config else {}
         info = {"model": self.hf.model_name, "ragkit_backend": type(self.hf).__name__,
-                "revision": getattr(model.config, "_commit_hash", None), "dtype": str(model.dtype),
+                "revision": getattr(model.config, "_commit_hash", None), "cache_revision": cache_revision(self.hf.model_name),
+                "dtype": str(model.dtype),
                 "device": str(model.device), "mps_available": bool(getattr(torch.backends, "mps", None)
                                                                    and torch.backends.mps.is_available()),
                 "cuda_available": torch.cuda.is_available(), "torch": torch.__version__,
@@ -79,6 +81,26 @@ class Qwen:
             except Exception:                                                   # noqa: BLE001
                 info[lib] = None
         return info
+
+
+def cache_revision(repo):
+    """The model revision as the Hugging Face cache records it, checked two independent ways: the
+    snapshot folder the cached config.json resolves to, and the commit the cache's refs/main names.
+    `verified` is True only when both exist and agree. Reads local files only."""
+    out = {"repo": repo, "snapshot": None, "refs_main": None, "verified": False}
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        path = try_to_load_from_cache(repo, "config.json")
+        if isinstance(path, str):
+            p = pathlib.Path(path)
+            out["snapshot"] = p.parent.name                              # .../snapshots/<commit>/config.json
+            ref = p.parents[2] / "refs" / "main"
+            if ref.exists():
+                out["refs_main"] = ref.read_text().strip()
+    except Exception as e:                                                      # noqa: BLE001
+        out["error"] = f"{type(e).__name__}: {e}"
+    out["verified"] = bool(out["snapshot"]) and out["snapshot"] == out["refs_main"] and len(out["snapshot"]) == 40
+    return out
 
 
 def load_qwen():
@@ -127,7 +149,8 @@ class Simulated:
         parts = re.findall(r"\[(\d+)\] \(from [^)]*\)\n(.+)", user)
         if not parts:
             return "I don't know based on the CVs."
-        return " ".join(f"{re.split(r'(?<=[.!?])\s', t.strip())[0][:200]} [{n}]" for n, t in parts[:2])
+        firsts = [(n, re.split(r"(?<=[.!?])\s", t.strip())[0][:200]) for n, t in parts[:2]]   # Python 3.11: no \ in f-strings
+        return " ".join(f"{first} [{n}]" for n, first in firsts)
 
     def chat_tools(self, messages, tools, max_tokens=MAX_NEW_TOKENS):
         self.calls += 1
