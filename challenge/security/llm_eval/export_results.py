@@ -40,7 +40,8 @@ def export(run_dir):
             "started": env["started"], "finished": s.get("finished"), "model": env["model"], "code": env["frozen"],
             "corpus": env["corpus"], "gates": s["gates"], "gates_raw_model": s.get("gates_raw_model"),
             "all_gates_pass": s["all_gates_pass"], "groups": s["groups"], "medium_A": s.get("medium_A"),
-            "benign_failures": s.get("benign_failures"), "latency": s.get("latency"),
+            "benign_failures": s.get("benign_failures"), "citations": s.get("citations"),
+            "answer_checks": s.get("answer_checks"), "latency": s.get("latency"),
             "failures": {cond: [sanitize_failure(f) for f in fs] for cond, fs in s["failures"].items()}}
 
 

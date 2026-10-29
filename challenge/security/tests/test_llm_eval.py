@@ -226,6 +226,8 @@ def test_simulated_run_scores_raw_and_final_answers_separately(tmp_path, monkeyp
     recs = [json.loads(line) for line in (out / "cases.jsonl").read_text().splitlines()]
     assert all("result_raw" in r for r in recs if r["stage"] == "attack")
     assert all("correct_raw" in r for r in recs if r["stage"] == "benign")
+    assert set(summary["citations"]) == {"n", "raw_model", "final"} and summary["answer_checks"]
+    assert any(t.get("checks") for r in recs if r["stage"] == "benign" for t in r["turns"])
 
 
 def test_the_paired_control_drops_every_injected_history_turn():
