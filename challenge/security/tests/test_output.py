@@ -177,6 +177,15 @@ def test_mcp_contact_tool_needs_authorization(server, monkeypatch):
     assert EMAIL in {c["value"] for c in got["contacts"]}
 
 
+def test_mcp_get_cv_errors_do_not_list_the_indexed_files(server):
+    """Finding 2026-10-29 (Claude + MCP evaluation): an unknown file name returned every indexed file name."""
+    for name in ("Nobody_Here.md", "../cvs/Rana_Khalil.md", "/etc/passwd", "rana_khalil.md", ""):
+        answer = server.get_cv(name)
+        assert set(answer) == {"error"}
+        assert "Omar_Saleh" not in answer["error"] and ("Rana_Khalil" not in answer["error"] or "Rana_Khalil" in name)
+    assert server.get_cv("Rana_Khalil.md")["source"] == "Rana_Khalil.md"      # an exact name still works
+
+
 def test_mcp_tools_are_read_only_and_serve_only_indexed_cvs(server, tmp_path):
     import chromadb
     folder = tmp_path / "chroma_db"

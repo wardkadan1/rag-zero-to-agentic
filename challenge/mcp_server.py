@@ -126,8 +126,8 @@ def get_cv(file_name: str) -> dict:
         return {"error": "index_rejected", "detail": str(e)}
     docs = documents()
     if file_name not in docs:                  # exact names from the index only: no paths, no other files
-        return {"error": f"No CV named {file_name!r}. Use the 'source' of a search_cvs passage.",
-                "available": sorted(docs)}
+        return {"error": f"No CV named {file_name!r}. Use the 'source' of a search_cvs passage."}   # 2026-10-29: no list
+                                               # of every indexed file (it told any caller who is in the index)
     first, text = docs[file_name]
     risk = output_guard.passage_risk(text)
     return {"source": file_name, "document_id": first.get("doc_id", ""), "candidate_id": first.get("candidate_id", ""),

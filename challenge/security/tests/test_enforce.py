@@ -188,6 +188,6 @@ def test_enforce_keeps_flagged_cvs_out_of_the_mcp_tools(tmp_path, monkeypatch):
                                                                                      "Sam_Tester_CV.pdf"}
         for name in ("Aaron_Abbot_CV.md", "Sam_Tester_CV.pdf", "Noor_Injection_CV.md"):
             answer = server.get_cv(name)
-            assert "error" in answer and name not in answer["available"]
+            assert "error" in answer and "available" not in answer
     finally:
         sys.modules.pop("mcp_server", None)
