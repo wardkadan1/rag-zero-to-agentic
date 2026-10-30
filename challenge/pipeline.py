@@ -611,20 +611,28 @@ def question_filters(question):
         if re.search(rf"\b{re.escape(city)}\b", question, re.I):
             want["city"] = CITY_ALIASES.get(city, city)
             break
-    m = re.search(r"(?:at least|minimum(?: of)?|more than|over)\s+(\d{1,2})\s*years?|(\d{1,2})\s*(?:\+|or more|plus)\s*years?", question, re.I)
+    # "more than 10" / "over 10" are strict (> 10); "at least 10", "10+", "10 or more" include 10
+    m = re.search(r"(at least|minimum(?: of)?|more than|over)\s+(\d{1,2})\s*years?|(\d{1,2})\s*(?:\+|or more|plus)\s*years?", question, re.I)
     if m:
-        want["years"] = int(m.group(1) or m.group(2))
+        want["years"] = int(m.group(2) or m.group(3))
+        want["years_op"] = "gt" if (m.group(1) or "").lower() in ("more than", "over") else "gte"
     return want
 
 
+def years_where(want):
+    return {"years": {"$gt" if want.get("years_op") == "gt" else "$gte": want["years"]}}
+
+
 def chroma_where(want):
-    parts = ([{"city": want["city"]}] if "city" in want else []) + ([{"years": {"$gte": want["years"]}}] if "years" in want else []) \
+    parts = ([{"city": want["city"]}] if "city" in want else []) + ([years_where(want)] if "years" in want else []) \
         + ([{"source": want["source"]}] if "source" in want else [])
     return None if not parts else parts[0] if len(parts) == 1 else {"$and": parts}
 
 
 def meets(chunk, want):
-    return (chunk.get("city") == want.get("city", chunk.get("city")) and chunk.get("years", 0) >= want.get("years", 0)
+    years = chunk.get("years", 0)
+    enough = "years" not in want or (years > want["years"] if want.get("years_op") == "gt" else years >= want["years"])
+    return (chunk.get("city") == want.get("city", chunk.get("city")) and enough
             and chunk.get("source") == want.get("source", chunk.get("source")))
 
 
@@ -673,10 +681,10 @@ def graph_hits(query, route):
     for source, name, entity in route:
         where = {"source": source}
         if "years" in want:                            # a minimum of years still applies
-            where = {"$and": [where, {"years": {"$gte": want["years"]}}]}
+            where = {"$and": [where, years_where(want)]}
         best = vector_search(query, 1, where)
         if best:
-            pool.append(dict(best[0], via=f"graph: {entity} → {name}"))
+            pool.append(dict(best[0], via=f"graph: {entity} → {name}", match="graph"))
     best = rerank(query, pool, len(pool)) if RERANK else pool
     if len(best) > GRAPH_MAX and "rerank" not in best[0]:                   # no reranker: the vector score decides
         best = sorted(best, key=lambda h: -h["score"])
@@ -776,19 +784,40 @@ def evidence(hit):
                             "claims_verified": False})
 
 
+def metadata_list(query):
+    """A list question whose only criteria are a city and/or years (no skill): every matching candidate.
+    None when it does not apply (then the normal search runs)."""
+    if not FILTERS or not list_intent(query):
+        return None
+    skills, want = criteria(query)
+    if skills or not want:
+        return None
+    return filter_hits(query, want)
+
+
 def agent_retrieve(query, k=K):
     AGENT_TRACE.clear()
     if not AGENT:
         route = graph_route(query)
-        return graph_hits(query, route) if route else search(query, k, question_filters(query) if FILTERS else {})
+        if route is not None:                          # [] = nobody meets ALL the criteria: nothing to answer from
+            return graph_hits(query, route) if route else []
+        listed = metadata_list(query)
+        return listed if listed is not None else search(query, k, question_filters(query) if FILTERS else {})
     # 1 · ROUTE
     route = graph_route(query)
+    if route == []:                                    # every criterion is known, but nobody meets them all
+        AGENT_TRACE.append("route: list → graph (nobody meets all the criteria)")
+        return []
     if route:
         hits = graph_hits(query, route)
         AGENT_TRACE.append(f"route: list → graph ({len(hits)} candidates)")
         if hits:                                       # 2 · EVALUATE: the graph found people
             return hits
         AGENT_TRACE.append("evaluate: graph found nobody → normal search")
+    listed = metadata_list(query)
+    if listed:
+        AGENT_TRACE.append(f"route: list → metadata filter ({len(listed)} candidates)")
+        return listed
     want = question_filters(query) if FILTERS else {}
     person = named_candidate(query)
     if person:
@@ -928,7 +957,8 @@ def make_query(question, history):
         if getattr(get_llm(), "can_reason", True):    # the offline fallback cannot rewrite
             earlier = "\n".join(f"- {q}" for q in history[-3:])
             rewritten = llm(REWRITE_PROMPT, f"Earlier questions:\n{earlier}\n\nLast question: {question}", 60).strip()
-            if 0 < len(rewritten) < 300:
+            # a rewrite that still says "he" / "that candidate" resolved nothing: the rule below does better
+            if 0 < len(rewritten) < 300 and not FOLLOW_UP.search(rewritten):
                 TURN.query = rewritten                # remediation 2026-10-29: the answer check knows who "that candidate" is
                 return rewritten
     except Exception as e:
@@ -948,6 +978,11 @@ def should_refuse(query, hits):
     and the lowest answerable one -8.8: -9.5 refuses no valid question and accepts those two misses."""
     if not hits:
         return True                                    # e.g. a filter that no CV meets
+    # A list answered by a structured match (graph edge, metadata filter) whose criteria ARE the whole
+    # question ("Which candidates live in Jerusalem?") is evidence by construction: the reranker cannot
+    # judge it, as one passage rarely "answers" such a question. Any further condition keeps the gate.
+    if all(h.get("match") in ("graph", "filter") for h in hits) and not residual_words(query):
+        return False
     top = hits[0].get("rerank")
     return top is not None and top < REFUSE_BELOW
 
@@ -1019,20 +1054,85 @@ def make_graph(chunks, version=None):
 
 
 LIST_QUESTION = re.compile(r"\b(which|who|list|all|any)\b[^?]*\bcandidates\b|\bcandidates\b[^?]*\b(who|with|that)\b", re.I)
+# "Who has X?", "Does anyone know X?", "Which people …", "List everyone …": the user wants every match
+LIST_CUE = re.compile(r"\b(?:list|everyone|everybody|anyone|anybody|all (?:the )?(?:people|applicants|developers|engineers)|"
+                      r"which (?:people|persons|applicants|ones|developers|engineers)|how many (?:people|applicants))\b", re.I)
+WHO_FIRST = re.compile(r"^\W*(?:who|which one)\b", re.I)
+# words that only say "has the criterion": not a further condition on the candidates
+CRITERION_WORDS = set("live lives living based located reside resides residing here built build building things stuff "
+                      "skill skills knowledge familiar proficient professional total years year yrs more than over least "
+                      "minimum plus does do there is are name names show me all everyone everybody anyone anybody list "
+                      "people persons applicants ones developers engineers".split())
+
+
+def criteria(query):
+    """The structured criteria a question names: graph skills, a known city, a years filter."""
+    skills = [sk for sk, rx in SKILL_RE.items() if rx.search(query)]
+    skills = [s for s in skills if not any(s != t and s in t for t in skills)]   # "spring" inside "spring boot"
+    return skills, question_filters(query)
+
+
+def residual_words(query):
+    """Content words left once the criteria and the "list / has" wording are taken out: further
+    conditions the structured match does not check ("…for a school district", "…a pilot license")."""
+    skills, want = criteria(query)
+    text = query
+    for s in skills:
+        text = SKILL_RE[s].sub(" ", text)
+    if "city" in want:
+        text = re.sub(rf"\b{re.escape(want['city'])}\b", " ", text, flags=re.I)
+        text = re.sub(r"\b(?:" + "|".join(re.escape(c) for c in CITIES) + r")\b", " ", text, flags=re.I)
+    words = [w for w in re.findall(r"[a-z][a-z+#.-]*", text.lower()) if w not in QUESTION_WORDS and w not in CRITERION_WORDS]
+    return words
+
+
+def list_intent(query):
+    """Does the question ask for EVERY candidate who meets structured criteria (not one fact)?"""
+    skills, want = criteria(query)
+    if not (skills or want):
+        return False
+    if LIST_QUESTION.search(query) or LIST_CUE.search(query):
+        return True
+    return bool(WHO_FIRST.search(query)) and len(residual_words(query)) <= 1
+
+
+def filter_hits(query, want):
+    """A list question whose criteria are metadata only (city, years): every candidate whose chunks
+    meet them, one best chunk each, ranked like graph_hits. One candidate = one candidate id (or file)."""
+    people = {}
+    for c in BM25["chunks"]:
+        if meets(c, want):
+            people.setdefault(c.get("candidate_id") or c["source"], (c["source"], c.get("name") or c["source"]))
+    flagged = {c["source"] for c in BM25["chunks"] if c.get("content_flagged")}
+    label = " + ".join(([f"city {want['city']}"] if "city" in want else []) +
+                       ([f"years {'>' if want.get('years_op') == 'gt' else '≥'} {want['years']}"] if "years" in want else []))
+    pool = []
+    for source, name in people.values():
+        best = vector_search(query, 1, chroma_where({**want, "source": source}))
+        if best:
+            pool.append(dict(best[0], via=f"filter: {label} → {name}", match="filter"))
+    best = rerank(query, pool, len(pool)) if RERANK else pool
+    best = sorted(best, key=lambda h: h["source"] in flagged)[:GRAPH_MAX]
+    return [dict(h, rank=i + 1) for i, h in enumerate(best)]
 
 
 def graph_route(query):
-    """STEP 7c · For a "which candidates …" question that names skills or a city of the graph:
+    """STEP 7c · For a list question (list_intent) that names skills or a city of the graph:
     every candidate connected to ALL of them (no top-K limit). None when it does not apply."""
-    if not GRAPH_ON or GRAPH.number_of_nodes() == 0 or not LIST_QUESTION.search(query):
+    if not GRAPH_ON or GRAPH.number_of_nodes() == 0 or not list_intent(query):
         return None
-    named = [("skill", sk) for sk, rx in SKILL_RE.items() if rx.search(query) and GRAPH.has_node(("skill", sk))]
-    named = [n for n in named if not any(n != m and n[1] in m[1] for m in named)]   # "spring" inside "spring boot"
-    want = question_filters(query)
-    if "city" in want and GRAPH.has_node(("city", want["city"])):
+    skills, want = criteria(query)
+    named = [("skill", sk) for sk in skills]
+    if "city" in want:
         named.append(("city", want["city"]))
     if not named:
         return None
+    if any(n[0] == "skill" and not GRAPH.has_node(n) for n in named):
+        return None                                    # a skill no CV has: the normal search and its unknown-term check decide
+    if not all(GRAPH.has_node(n) for n in named):
+        # a named city nobody lives in: with skills, nobody meets ALL the criteria; a city alone may
+        # still be in the chunk metadata (metadata_list)
+        return [] if skills else None
     people = set.intersection(*(set(GRAPH.neighbors(n)) for n in named))
     return [(GRAPH.nodes[p]["source"], GRAPH.nodes[p].get("name", p[1]), " + ".join(n[1] for n in named))
             for p in sorted(people)]
